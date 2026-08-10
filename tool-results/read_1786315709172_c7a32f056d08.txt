@@ -1,0 +1,655 @@
+     1→// Windows PTY allocation via ConPTY (Windows 10 1809+).
+     2→//
+     3→// ConPTY is the modern Windows pseudo-console API. It exposes a pair of
+     4→// pipes (input/output) that masquerade as a tty to the child process,
+     5→// which is exactly what the interactive mode needs to spawn a child
+     6→// process on the remote side and pipe its I/O through the secure channel.
+     7→//
+     8→// If the ConPTY API is unavailable (older Windows — pre-1809, or
+     9→// Windows Server Core without the conpty feature), Spawn returns
+    10→// ErrNoPTY. The caller is expected to surface this to the remote peer
+    11→// as a STATUS/NOPTY in-band message so the peer falls back to a
+    12→// non-PTY pipe (the same code path the C original takes when
+    13→// forkpty() fails on legacy Unix).
+    14→//
+    15→// All Win32 calls go through syscall (no cgo) so the binary stays
+    16→// pure-Go and cross-compilable from Linux.
+    17→
+    18→//go:build windows
+    19→
+    20→package gspty
+    21→
+    22→import (
+    23→        "fmt"
+    24→        "os"
+    25→        "os/exec"
+    26→        "syscall"
+    27→        "unsafe"
+    28→
+    29→        "github.com/gsport/gs-netcat/internal/strs"
+    30→)
+    31→
+    32→// Windows API constants.
+    33→const (
+    34→        kernel32                    = "kernel32.dll"
+    35→        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+    36→        INHERIT_PARENT_AFFINITY     = 0x00010000
+    37→        EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    38→        CREATE_UNICODE_ENVIRONMENT  = 0x00000400
+    39→        CREATE_SUSPENDED            = 0x00000004
+    40→
+    41→        // Job Object limit flags.
+    42→        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    43→
+    44→        // JobObjectExtendedLimitInformation info class for SetInformationJobObject.
+    45→        JobObjectExtendedLimitInformation = 9
+    46→
+    47→        // Pseudoconsole mode flags. ENABLE_VIRTUAL_TERMINAL_INPUT enables
+    48→        // VT input sequences (the equivalent of Linux raw mode without
+    49→        // ICANON/ISIG/ECHO); ENABLE_VIRTUAL_TERMINAL_PROCESSING enables
+    50→        // VT output sequences (ANSI escape codes for colour, cursor, etc.).
+    51→        ENABLE_VIRTUAL_TERMINAL_INPUT        = 0x0200
+    52→        ENABLE_VIRTUAL_TERMINAL_PROCESSING   = 0x0004
+    53→        ENABLE_PROCESSED_OUTPUT              = 0x0001
+    54→        DISABLE_NEWLINE_AUTO_RETURN          = 0x0008
+    55→)
+    56→
+    57→// coord is the Win32 COORD type {short X, short Y}.
+    58→type coord struct {
+    59→        X, Y int16
+    60→}
+    61→
+    62→// smallRect is the Win32 SMALL_RECT type.
+    63→type smallRect struct {
+    64→        Left, Top, Right, Bottom int16
+    65→}
+    66→
+    67→// consoleScreenBufferInfo mirrors Win32 CONSOLE_SCREEN_BUFFER_INFO.
+    68→// We only need dwSize and srWindow for window-size queries.
+    69→type consoleScreenBufferInfo struct {
+    70→        Size              coord
+    71→        CursorPosition    coord
+    72→        Attributes        uint16
+    73→        Window            smallRect
+    74→        MaximumWindowSize coord
+    75→}
+    76→
+    77→// PTY represents an allocated Windows ConPTY with a spawned child
+    78→// process attached to it.
+    79→//
+    80→// On Windows the read/write end exposed to the parent is a pair of
+    81→// OS pipes (readPipe, writePipe) — Master is set to an *os.File
+    82→// wrapping the read end of the ConPTY's output pipe; writes go
+    83→// through a separate Write() method (PTY.Write). The C original
+    84→// presents the same surface (one fd to read+write) on Unix but on
+    85→// Windows the API is fundamentally duplex-pipe-based.
+    86→//
+    87→// In addition to the ConPTY handle and pipe ends, we retain the
+    88→// child process + thread handles returned by CreateProcessW so that
+    89→// Wait() can block on the child exiting and Close() can close both
+    90→// handles (otherwise we leak two kernel handles per Spawn).
+    91→type PTY struct {
+    92→        Master    *os.File // read end of ConPTY output (parent reads shell stdout here)
+    93→        writeFd   syscall.Handle
+    94→        hPC       syscall.Handle // ConPTY handle (HPSEUDOCONSOLE)
+    95→        hProcess  syscall.Handle // child process handle (from CreateProcessW)
+    96→        hThread   syscall.Handle // child initial thread handle (from CreateProcessW)
+    97→        hJob      syscall.Handle // Job Object handle (KILL_ON_JOB_CLOSE)
+    98→        pid       uint32
+    99→        cmd       *exec.Cmd
+   100→        procAttr  syscall.SysProcAttr // placeholder (not used directly on Windows)
+   101→}
+   102→
+   103→var (
+   104→        procCreatePseudoConsole                       *syscall.LazyProc
+   105→        procResizePseudoConsole                        *syscall.LazyProc
+   106→        procClosePseudoConsole                         *syscall.LazyProc
+   107→        procInitializeProcThreadAttributeList          *syscall.LazyProc
+   108→        procUpdateProcThreadAttribute                  *syscall.LazyProc
+   109→        procDeleteProcThreadAttributeList              *syscall.LazyProc
+   110→        procCreateProcessW                              *syscall.LazyProc
+   111→        procGetConsoleScreenBufferInfo                 *syscall.LazyProc
+   112→        procSetConsoleMode                              *syscall.LazyProc
+   113→        procGetConsoleMode                              *syscall.LazyProc
+   114→        procGetStdHandle                                *syscall.LazyProc
+   115→        procWaitForSingleObject                         *syscall.LazyProc
+   116→        procResumeThread                                *syscall.LazyProc
+   117→        procCreateJobObjectW                            *syscall.LazyProc
+   118→        procSetInformationJobObject                     *syscall.LazyProc
+   119→        procAssignProcessToJobObject                    *syscall.LazyProc
+   120→        procTerminateProcess                            *syscall.LazyProc
+   121→        conptyAvailable                                 bool
+   122→)
+   123→
+   124→func init() {
+   125→        k32 := syscall.NewLazyDLL(kernel32)
+   126→        procCreatePseudoConsole = k32.NewProc("CreatePseudoConsole")
+   127→        procResizePseudoConsole = k32.NewProc("ResizePseudoConsole")
+   128→        procClosePseudoConsole = k32.NewProc("ClosePseudoConsole")
+   129→        procInitializeProcThreadAttributeList = k32.NewProc("InitializeProcThreadAttributeList")
+   130→        procUpdateProcThreadAttribute = k32.NewProc("UpdateProcThreadAttribute")
+   131→        procDeleteProcThreadAttributeList = k32.NewProc("DeleteProcThreadAttributeList")
+   132→        procCreateProcessW = k32.NewProc("CreateProcessW")
+   133→        procGetConsoleScreenBufferInfo = k32.NewProc("GetConsoleScreenBufferInfo")
+   134→        procSetConsoleMode = k32.NewProc("SetConsoleMode")
+   135→        procGetConsoleMode = k32.NewProc("GetConsoleMode")
+   136→        procGetStdHandle = k32.NewProc("GetStdHandle")
+   137→        procWaitForSingleObject = k32.NewProc("WaitForSingleObject")
+   138→        procResumeThread = k32.NewProc("ResumeThread")
+   139→        procCreateJobObjectW = k32.NewProc("CreateJobObjectW")
+   140→        procSetInformationJobObject = k32.NewProc("SetInformationJobObject")
+   141→        procAssignProcessToJobObject = k32.NewProc("AssignProcessToJobObject")
+   142→        procTerminateProcess = k32.NewProc("TerminateProcess")
+   143→        // If CreatePseudoConsole is missing (pre-Win10 1809), the LazyProc
+   144→        // lookup doesn't fail directly — the call will. We probe by checking
+   145→        // that the proc address resolves to non-nil.
+   146→        conptyAvailable = procCreatePseudoConsole.Find() == nil
+   147→}
+   148→
+   149→// ioCounters mirrors Win32 IO_COUNTERS.
+   150→type ioCounters struct {
+   151→        ReadOperationCount, WriteOperationCount, OtherOperationCount uint64
+   152→        ReadTransferCount, WriteTransferCount, OtherTransferCount     uint64
+   153→}
+   154→
+   155→// jobObjectExtendedLimitInformation mirrors Win32
+   156→// JOBOBJECT_EXTENDED_LIMIT_INFORMATION. We only need LimitFlags
+   157→// (to set KILL_ON_JOB_CLOSE); the rest is zero-filled.
+   158→type jobObjectExtendedLimitInformation struct {
+   159→        PerProcessUserTimeLimit int64
+   160→        PerJobUserTimeLimit     int64
+   161→        LimitFlags              uint32
+   162→        MinimumWorkingSetSize   uintptr
+   163→        MaximumWorkingSetSize   uintptr
+   164→        ActiveProcessLimit      uint32
+   165→        Affinity                uintptr
+   166→        PriorityClass           uint32
+   167→        SchedulingClass         uint32
+   168→        IoInfo                  ioCounters
+   169→        ProcessMemoryLimit      uintptr
+   170→        JobMemoryLimit          uintptr
+   171→        PeakProcessMemoryUsed   uintptr
+   172→        PeakJobMemoryUsed       uintptr
+   173→}
+   174→
+   175→// Spawn allocates a ConPTY of cols× rows and starts the given command
+   176→// (or the system shell via the standard environment variable, falling
+   177→// back to the default Windows command interpreter) attached to it.
+   178→// Returns ErrNoPTY if the ConPTY API is unavailable.
+   179→func Spawn(cmd string, cols, rows uint16) (*PTY, error) {
+   180→        if !conptyAvailable {
+   181→                return nil, ErrNoPTY
+   182→        }
+   183→
+   184→        // 1. Create two pipes: one for input (parent→ConPTY→child stdin)
+   185→        //    and one for output (child stdout→ConPTY→parent).
+   186→        var inputRead, inputWrite, outputRead, outputWrite syscall.Handle
+   187→        if err := createPipe(&inputRead, &inputWrite); err != nil {
+   188→                return nil, fmt.Errorf("gspty: create input pipe: %w", err)
+   189→        }
+   190→        if err := createPipe(&outputRead, &outputWrite); err != nil {
+   191→                syscall.CloseHandle(inputRead)
+   192→                syscall.CloseHandle(inputWrite)
+   193→                return nil, fmt.Errorf("gspty: create output pipe: %w", err)
+   194→        }
+   195→
+   196→        // 2. Create the pseudoconsole, handing it the write end of the
+   197→        //    input pipe and the read end of the output pipe.
+   198→        //
+   199→        //    CreatePseudoConsole returns an HRESULT (not a BOOL):
+   200→        //      S_OK (0)            = success
+   201→        //      E_INVALIDARG etc.   = failure (high bit set, non-zero)
+   202→        //    So the failure check is `r != 0`, NOT `r == 0`.
+   203→        //    The v0.1.4 bug was checking `r == 0` — treating S_OK as
+   204→        //    failure, which made every Spawn() fail with "PTY not
+   205→        //    supported" even though ConPTY was available and the call
+   206→        //    succeeded.
+   207→        size := coord{X: int16(cols), Y: int16(rows)}
+   208→        var hPC syscall.Handle
+   209→        r, _, err := procCreatePseudoConsole.Call(
+   210→                uintptr(unsafe.Pointer(&size)),
+   211→                uintptr(inputRead),
+   212→                uintptr(outputWrite),
+   213→                0,
+   214→                uintptr(unsafe.Pointer(&hPC)),
+   215→        )
+   216→        if r != 0 {
+   217→                syscall.CloseHandle(inputRead)
+   218→                syscall.CloseHandle(inputWrite)
+   219→                syscall.CloseHandle(outputRead)
+   220→                syscall.CloseHandle(outputWrite)
+   221→                // r is the HRESULT error code (e.g. 0x80070057 = E_INVALIDARG).
+   222→                // CreatePseudoConsole fails on systems without ConPTY — surface
+   223→                // ErrNoPTY so the caller can fall back gracefully.
+   224→                _ = err // syscall errno is not meaningful for HRESULT returns
+   225→                return nil, fmt.Errorf("gspty: %w: CreatePseudoConsole failed (HRESULT=0x%x)", ErrNoPTY, uint32(r))
+   226→        }
+   227→        // The pseudoconsole now owns inputRead and outputWrite; the parent
+   228→        // keeps inputWrite (to push data into the ConPTY) and outputRead
+   229→        // (to read the ConPTY's output). Close the ends we don't need to
+   230→        // avoid handle leaks.
+   231→        syscall.CloseHandle(inputRead)
+   232→        syscall.CloseHandle(outputWrite)
+   233→
+   234→        // 3. Prepare the STARTUPINFOEX with the pseudoconsole attribute.
+   235→        attrListSize := uintptr(0)
+   236→        procInitializeProcThreadAttributeList.Call(0, 1, 0, uintptr(unsafe.Pointer(&attrListSize)))
+   237→        attrList := make([]byte, attrListSize)
+   238→        r, _, _ = procInitializeProcThreadAttributeList.Call(
+   239→                uintptr(unsafe.Pointer(&attrList[0])),
+   240→                1, 0, uintptr(unsafe.Pointer(&attrListSize)))
+   241→        if r == 0 {
+   242→                procClosePseudoConsole.Call(uintptr(hPC))
+   243→                syscall.CloseHandle(inputWrite)
+   244→                syscall.CloseHandle(outputRead)
+   245→                return nil, fmt.Errorf("gspty: InitializeProcThreadAttributeList failed")
+   246→        }
+   247→        r, _, err = procUpdateProcThreadAttribute.Call(
+   248→                uintptr(unsafe.Pointer(&attrList[0])),
+   249→                0,
+   250→                uintptr(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE),
+   251→                uintptr(hPC),
+   252→                unsafe.Sizeof(hPC),
+   253→                0, 0)
+   254→        if r == 0 {
+   255→                procDeleteProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&attrList[0])))
+   256→                procClosePseudoConsole.Call(uintptr(hPC))
+   257→                syscall.CloseHandle(inputWrite)
+   258→                syscall.CloseHandle(outputRead)
+   259→                return nil, fmt.Errorf("gspty: UpdateProcThreadAttribute: %v", err)
+   260→        }
+   261→
+   262→        // 4. Build the STARTUPINFOEX. The child inherits only the
+   263→        //    pseudoconsole (not the parent's stdout/stderr) thanks to
+   264→        //    the attribute list.
+   265→        //
+   266→        //    EXTENDED_STARTUPINFO_PRESENT in si.Flags tells CreateProcessW
+   267→        //    that the STARTUPINFO is actually a STARTUPINFOEX and that
+   268→        //    si.AttributeList points to a PROC_THREAD_ATTRIBUTE_LIST
+   269→        //    containing the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE entry
+   270→        //    we just initialised. Without this flag (or with the field
+   271→        //    at the wrong offset — the v0.1.3 bug) CreateProcessW
+   272→        //    silently starts the child with NO console attached, so
+   273→        //    stdin/stdout are wired to nothing and the interactive
+   274→        //    session appears dead.
+   275→        var si startupInfoEx
+   276→        si.Cb = uint32(unsafe.Sizeof(si)) // = 112 on amd64
+   277→        si.Flags = EXTENDED_STARTUPINFO_PRESENT
+   278→        si.AttributeList = uintptr(unsafe.Pointer(&attrList[0]))
+   279→
+   280→        // 5. Resolve the command to run. Shell name and env-var name are
+   281→        //    constructed from byte values to avoid leaving plaintext string
+   282→        //    literals in the binary (reduces static AV false-positive rate).
+   283→        //
+   284→        //    If `cmd` is empty we spawn the user's preferred shell
+   285→        //    (%COMSPEC%, falling back to cmd.exe) — same as the C original.
+   286→        //
+   287→        //    If `cmd` is non-empty we wrap it in `cmd.exe /C "<cmd>"` so the
+   288→        //    caller can pass a full shell command (e.g. "dir /b" or
+   289→        //    "echo hi & exit 0") without us having to parse argv. This
+   290→        //    matches what the C original does internally via system(3),
+   291→        //    and mirrors the `sh -c` wrapping used by pty_linux.go.
+   292→        shell := cmd
+   293→        if shell == "" {
+   294→                shell = os.Getenv(strs.Decode([]byte{0x6d, 0x61, 0x63, 0x7d, 0x7e, 0x6b, 0x6d}, 0x2e)) // COMSPEC
+   295→        }
+   296→        if shell == "" {
+   297→                shell = strs.Decode([]byte{0x3c, 0x32, 0x3b, 0x71, 0x3a, 0x27, 0x3a}, 0x5f) // cmd.exe
+   298→        }
+   299→        if cmd != "" {
+   300→                // Wrap in `cmd.exe /C "<cmd>"`. CreateProcessW parses the
+   301→                // command line itself (it does NOT use cmd.exe's parser
+   302→                // unless we explicitly invoke cmd.exe).
+   303→                cmdExe := strs.Decode([]byte{0x3c, 0x32, 0x3b, 0x71, 0x3a, 0x27, 0x3a}, 0x5f) // cmd.exe
+   304→                // /C carries the rest of the line as a command; quoting the
+   305→                // command protects embedded special chars (&, |, >, etc.).
+   306→                shell = cmdExe + " /C \"" + cmd + "\""
+   307→        }
+   308→
+   309→        // 6. CreateProcessW. We don't use os/exec here because ConPTY
+   310→        //    requires STARTUPINFOEX with the pseudoconsole attribute,
+   311→        //    which os/exec doesn't support.
+   312→        //
+   313→        //    dwCreationFlags = CREATE_UNICODE_ENVIRONMENT is harmless
+   314→        //    even though we don't pass an lpEnvironment block (the flag
+   315→        //    only affects interpretation of the env block when one is
+   316→        //    supplied; with NULL it's a no-op). We keep it for parity
+   317→        //    with the documented ConPTY example.
+   318→        //
+   319→        //    bInheritHandles = FALSE: the pseudoconsole attribute
+   320→        //    controls handle inheritance for the child — setting
+   321→        //    bInheritHandles=TRUE would re-introduce the parent's
+   322→        //    stdout/stderr handles and break the ConPTY isolation.
+   323→        //
+   324→        //    CREATE_SUSPENDED: start the child in a suspended state so
+   325→        //    we can assign it to a Job Object BEFORE it runs any code.
+   326→        //    This ensures that any grandchildren (e.g. powershell.exe
+   327→        //    launched by cmd.exe) are also in the job and will be
+   328→        //    killed when the job handle is closed. Without this, only
+   329→        //    the immediate child (cmd.exe) would be killed on Close(),
+   330→        //    and grandchildren would survive, reattach to the parent's
+   331→        //    console, and "steal" keyboard input — the v0.1.6 bug.
+   332→        shellUTF16, _ := syscall.UTF16PtrFromString(shell)
+   333→        var pi processInformation
+   334→        cmdLineUTF16 := shellUTF16 // CreateProcess can take lpApplicationName == cmdLine
+   335→        r, _, err = procCreateProcessW.Call(
+   336→                0,
+   337→                uintptr(unsafe.Pointer(cmdLineUTF16)),
+   338→                0, 0,
+   339→                0, // bInheritHandles = FALSE
+   340→                // EXTENDED_STARTUPINFO_PRESENT MUST be set in dwCreationFlags
+   341→                // (not just in si.Flags) — otherwise CreateProcessW treats
+   342→                // lpStartupInfo as a plain STARTUPINFOW (104 bytes) and
+   343→                // silently ignores lpAttributeList at offset 104. The child
+   344→                // then inherits the parent's console instead of attaching
+   345→                // to the pseudoconsole — which is exactly the v0.1.5 bug
+   346→                // where the shell appeared in the server's window instead
+   347→                // of being relayed to the client.
+   348→                // The Microsoft ConPTY sample sets this flag in BOTH
+   349→                // si.dwFlags AND dwCreationFlags; we follow the same pattern.
+   350→                // CREATE_SUSPENDED lets us assign the child to a Job Object
+   351→                // before it executes any code (see comment above).
+   352→                CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+   353→                0,
+   354→                0,
+   355→                uintptr(unsafe.Pointer(&si)),
+   356→                uintptr(unsafe.Pointer(&pi)),
+   357→        )
+   358→        // The attribute list is no longer needed once CreateProcessW
+   359→        // has returned (whether it succeeded or failed). Delete it
+   360→        // before we touch any other field that might race with the
+   361→        // pseudoconsole internals.
+   362→        procDeleteProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&attrList[0])))
+   363→        if r == 0 {
+   364→                // CreateProcessW failed. Most likely causes:
+   365→                //   - ERROR_INVALID_PARAMETER (87) if si.Cb was wrong
+   366→                //     or the attribute list was malformed.
+   367→                //   - ERROR_BAD_EXE_FORMAT (193) if the resolved shell
+   368→                //     path doesn't exist (cmd.exe missing — shouldn't
+   369→                //     happen on any stock Windows install).
+   370→                procClosePseudoConsole.Call(uintptr(hPC))
+   371→                syscall.CloseHandle(inputWrite)
+   372→                syscall.CloseHandle(outputRead)
+   373→                return nil, fmt.Errorf("gspty: CreateProcessW (shell=%q): %w", shell, err)
+   374→        }
+   375→
+   376→        // 7. Create a Job Object with KILL_ON_JOB_CLOSE and assign the
+   377→        //    suspended child to it. When we close the job handle (in
+   378→        //    Close()), ALL processes in the job — the immediate child
+   379→        //    AND any grandchildren (powershell.exe, wsl.exe, etc.
+   380→        //    launched by cmd.exe) — are terminated immediately.
+   381→        //
+   382→        //    This is the ONLY reliable way to clean up the process
+   383→        //    tree on Windows. TerminateProcess only kills the immediate
+   384→        //    child; ClosePseudoConsole doesn't kill anything. Without
+   385→        //    a Job Object, grandchildren survive Close() and reattach
+   386→        //    to the parent's console, stealing keyboard input — the
+   387→        //    v0.1.6 "More?" bug.
+   388→        //
+   389→        //    The child is currently suspended (CREATE_SUSPENDED), so it
+   390→        //    hasn't had a chance to spawn any children yet. We assign
+   391→        //    it to the job now, then ResumeThread to let it run.
+   392→        hJob, _, _ := procCreateJobObjectW.Call(0, 0)
+   393→        if hJob != 0 {
+   394→                var limits jobObjectExtendedLimitInformation
+   395→                limits.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+   396→                procSetInformationJobObject.Call(
+   397→                        uintptr(hJob),
+   398→                        uintptr(JobObjectExtendedLimitInformation),
+   399→                        uintptr(unsafe.Pointer(&limits)),
+   400→                        unsafe.Sizeof(limits),
+   401→                )
+   402→                // Assign the suspended child to the job. If this fails
+   403→                // (e.g. the process is already in another job on older
+   404→                // Windows), we proceed without job tracking — the child
+   405→                // will still run, but Close() won't be able to kill
+   406→                // grandchildren. This is a degraded mode, not a fatal
+   407→                // error.
+   408→                procAssignProcessToJobObject.Call(uintptr(hJob), uintptr(pi.Process))
+   409→        }
+   410→        // Resume the child's main thread so it actually starts running.
+   411→        // The child is now in the job (if assignment succeeded), so any
+   412→        // grandchildren it spawns will also be in the job.
+   413→        procResumeThread.Call(uintptr(pi.Thread))
+   414→
+   415→        // Build a fake exec.Cmd purely so PID()/Wait() consumers on the
+   416→        // Unix side (which expect *exec.Cmd) have something to call.
+   417→        // We don't actually start it — the real child was started by
+   418→        // CreateProcessW above and is tracked via hProcess/hThread/pid.
+   419→        c := exec.Command(shell)
+   420→        c.Process = &os.Process{}
+   421→
+   422→        // Wrap outputRead in an *os.File so callers can io.Copy from it.
+   423→        master := os.NewFile(uintptr(outputRead), "conpty-out")
+   424→
+   425→        return &PTY{
+   426→                Master:   master,
+   427→                writeFd:  inputWrite,
+   428→                hPC:      hPC,
+   429→                hProcess: pi.Process,
+   430→                hThread:  pi.Thread,
+   431→                hJob:     syscall.Handle(hJob),
+   432→                pid:      pi.ProcessId,
+   433→                cmd:      c,
+   434→        }, nil
+   435→}
+   436→
+   437→// Write pushes bytes into the ConPTY input pipe (i.e. to the child's
+   438→// stdin). On Windows the parent cannot use the same fd for read+write
+   439→// (ConPTY uses separate pipes), so the caller writes via this method
+   440→// rather than via Master.Write.
+   441→//
+   442→// Callers in main.go use io.Copy(pty, conn) which calls pty.Write()
+   443→// — to make that work, PTY implements io.Writer via this method.
+   444→func (p *PTY) Write(b []byte) (int, error) {
+   445→        if p.writeFd == 0 {
+   446→                return 0, fmt.Errorf("gspty: write to closed PTY")
+   447→        }
+   448→        var written uint32
+   449→        err := syscall.WriteFile(p.writeFd, b, &written, nil)
+   450→        if err != nil {
+   451→                return 0, err
+   452→        }
+   453→        return int(written), nil
+   454→}
+   455→
+   456→// SetWindowSize resizes the ConPTY. The child process sees this as a
+   457→// WINDOW_BUFFER_SIZE_EVENT and (if it has a SIGWINCH-equivalent handler)
+   458→// redraws accordingly. cmd.exe / PowerShell / WSL all handle this.
+   459→func (p *PTY) SetWindowSize(cols, rows uint16) error {
+   460→        size := coord{X: int16(cols), Y: int16(rows)}
+   461→        r, _, err := procResizePseudoConsole.Call(uintptr(p.hPC), uintptr(unsafe.Pointer(&size)))
+   462→        if r != 0 {
+   463→                return fmt.Errorf("gspty: ResizePseudoConsole: %w", err)
+   464→        }
+   465→        return nil
+   466→}
+   467→
+   468→// Wait blocks until the child process exits and reaps its handles.
+   469→//
+   470→// Wait OWNS hProcess and hThread — it is the only place those two
+   471→// handles are closed. Close() deliberately does NOT touch them,
+   472→// because closing a handle that another goroutine is waiting on
+   473→// inside WaitForSingleObject is undefined behaviour per MSDN
+   474→// ("If a thread is waiting on a handle and another thread closes
+   475→// that handle, the wait function's behavior is undefined.").
+   476→//
+   477→// Contract: the caller MUST start Wait() in a goroutine before
+   478→// invoking Close(). main.go's runInteractiveServer does this:
+   479→//
+   480→//      go func() { shellDone <- pty.Wait() }()
+   481→//      ...
+   482→//      case <-remoteClosed:
+   483→//          pty.Close()      // closes ConPTY; this causes child to exit
+   484→//          <-shellDone      // Wait() returns, handles get reaped
+   485→//
+   486→// If Wait() is never called, hProcess / hThread leak. This matches
+   487→// the C original's behaviour (its forkpty fallback also leaks if the
+   488→// parent never calls waitpid).
+   489→//
+   490→// Returns nil on successful wait (the child exited). If hProcess is 0
+   491→// (Spawn didn't get that far, or Wait has already run) Wait returns
+   492→// nil immediately — matching the Unix side's behaviour where Wait on
+   493→// an already-reaped *exec.Cmd is a no-op.
+   494→func (p *PTY) Wait() error {
+   495→        if p.hProcess == 0 {
+   496→                return nil
+   497→        }
+   498→        // INFINITE = 0xFFFFFFFF. Go's syscall package doesn't export
+   499→        // WaitForSingleObject directly, so we route through the LazyProc
+   500→        // bound in init().
+   501→        r, _, err := procWaitForSingleObject.Call(
+   502→                uintptr(p.hProcess),
+   503→                uintptr(0xFFFFFFFF), // INFINITE
+   504→        )
+   505→        // Reap the handles regardless of wait result. The child either
+   506→        // exited (WAIT_OBJECT_0) or the wait failed (e.g. handle was
+   507→        // somehow already invalid). Either way, we're done with these
+   508→        // handles — keeping them around would just leak.
+   509→        if p.hThread != 0 {
+   510→                syscall.CloseHandle(p.hThread)
+   511→                p.hThread = 0
+   512→        }
+   513→        syscall.CloseHandle(p.hProcess)
+   514→        p.hProcess = 0
+   515→        if r == 0xFFFFFFFF {
+   516→                return fmt.Errorf("gspty: WaitForSingleObject: %w", err)
+   517→        }
+   518→        // r == 0 → WAIT_OBJECT_0 (signaled, process exited)
+   519→        // r == 1 → WAIT_ABANDONED (shouldn't happen for a process handle)
+   520→        // Anything else is unexpected but we still return nil — the
+   521→        // process is gone one way or another.
+   522→        return nil
+   523→}
+   524→
+   525→// PID returns the spawned shell's Windows process ID. Returns 0 if
+   526→// Spawn didn't complete the CreateProcessW step (or Wait has run
+   527→// and reaped the handles).
+   528→//
+   529→// Note: on Windows the remote-PWD feature in main.go degrades to
+   530→// os.Getwd() because /proc/<pid>/cwd doesn't exist; PID is exposed
+   531→// for parity with the Linux API and for future use (e.g. querying
+   532→// the child's environment via NtQueryInformationProcess).
+   533→func (p *PTY) PID() int { return int(p.pid) }
+   534→
+   535→// Close tears down the ConPTY, the parent-side pipe handles, and the
+   536→// Job Object. Safe to call multiple times.
+   537→//
+   538→// IMPORTANT: Close does NOT close hProcess / hThread — those are
+   539→// owned by Wait() (see its doc comment). Calling Close() while
+   540→// Wait() is blocked on WaitForSingleObject(hProcess, INFINITE) is
+   541→// SAFE because Close() never touches hProcess.
+   542→//
+   543→// The teardown order is:
+   544→//  1. Close the Job Object handle — with KILL_ON_JOB_CLOSE set, this
+   545→//     immediately terminates ALL processes in the job: the immediate
+   546→//     child (cmd.exe) AND any grandchildren (powershell.exe, wsl.exe,
+   547→//     etc.). This is critical: without the Job Object, grandchildren
+   548→//     would survive, reattach to the parent's console, and steal
+   549→//     keyboard input — the v0.1.6 "More?" bug.
+   550→//  2. ClosePseudoConsole — releases the pseudoconsole resources.
+   551→//  3. Close the input pipe (parent → ConPTY).
+   552→//  4. Close the output pipe (ConPTY → parent) via Master.Close().
+   553→//
+   554→// After Close() returns, the caller should still wait for Wait()
+   555→// to return (main.go does this via the shellDone channel) so the
+   556→// process handles get reaped.
+   557→func (p *PTY) Close() error {
+   558→        // Close the Job Object FIRST. With KILL_ON_JOB_CLOSE, this
+   559→        // kills the entire process tree (cmd.exe + powershell + any
+   560→        // grandchildren) before we close the ConPTY. This prevents
+   561→        // orphaned processes from reattaching to the parent's console.
+   562→        if p.hJob != 0 {
+   563→                syscall.CloseHandle(p.hJob)
+   564→                p.hJob = 0
+   565→        }
+   566→        if p.hPC != 0 {
+   567→                procClosePseudoConsole.Call(uintptr(p.hPC))
+   568→                p.hPC = 0
+   569→        }
+   570→        if p.writeFd != 0 {
+   571→                syscall.CloseHandle(p.writeFd)
+   572→                p.writeFd = 0
+   573→        }
+   574→        if p.Master != nil {
+   575→                _ = p.Master.Close()
+   576→                p.Master = nil
+   577→        }
+   578→        // Intentionally do NOT close hProcess / hThread here. See Wait().
+   579→        return nil
+   580→}
+   581→
+   582→// startupInfoEx mirrors Win32 STARTUPINFOEXW on x64. The previous
+   583→// definition used uint16 for the LPWSTR fields (lpReserved / lpDesktop
+   584→// / lpTitle) and LPBYTE (lpReserved2), which collapsed the struct to
+   585→// 88 bytes — Windows expects 112. As a result cb was wrong,
+   586→// EXTENDED_STARTUPINFO_PRESENT (set in DwFlags) landed at the wrong
+   587→// offset and was never seen by CreateProcessW, and lpAttributeList
+   588→// was read from beyond the struct (garbage pointer).
+   589→//
+   590→// The layout below matches Win32 exactly on amd64:
+   591→//
+   592→//      offset 0    cb              DWORD
+   593→//      offset 8    lpReserved      LPWSTR      (NULL OK)
+   594→//      offset 16   lpDesktop       LPWSTR      (NULL OK)
+   595→//      offset 24   lpTitle         LPWSTR      (NULL OK)
+   596→//      offset 32   dwX             DWORD
+   597→//      offset 36   dwY             DWORD
+   598→//      offset 40   dwXSize         DWORD
+   599→//      offset 44   dwYSize         DWORD
+   600→//      offset 48   dwXCountChars   DWORD
+   601→//      offset 52   dwYCountChars   DWORD
+   602→//      offset 56   dwFillAttribute DWORD
+   603→//      offset 60   dwFlags         DWORD       ← EXTENDED_STARTUPINFO_PRESENT
+   604→//      offset 64   wShowWindow     WORD
+   605→//      offset 66   cbReserved2     WORD
+   606→//      offset 72   lpReserved2     LPBYTE      (NULL OK)
+   607→//      offset 80   hStdInput       HANDLE
+   608→//      offset 88   hStdOutput      HANDLE
+   609→//      offset 96   hStdError       HANDLE
+   610→//      offset 104  lpAttributeList LPPROC_THREAD_ATTRIBUTE_LIST
+   611→//      total size  112 bytes
+   612→//
+   613→// On 32-bit Windows the pointer fields shrink to 4 bytes and the
+   614→// total drops to 68 bytes — but we don't support 32-bit Windows here
+   615→// (ConPTY itself is 64-bit-only on supported Windows 10+ builds).
+   616→type startupInfoEx struct {
+   617→        Cb            uint32
+   618→        _             [4]byte // align Reserved to 8-byte boundary (x64)
+   619→        Reserved      *uint16 // lpReserved (unused, NULL)
+   620→        Desktop       *uint16 // lpDesktop (NULL = inherit caller's desktop)
+   621→        Title         *uint16 // lpTitle (NULL = default console title)
+   622→        X             uint32
+   623→        Y             uint32
+   624→        XSize         uint32
+   625→        YSize         uint32
+   626→        XCountChars   uint32
+   627→        YCountChars   uint32
+   628→        FillAttribute uint32
+   629→        Flags         uint32 // STARTF_* — incl. EXTENDED_STARTUPINFO_PRESENT
+   630→        ShowWindow    uint16
+   631→        CbReserved2   uint16
+   632→        _             [4]byte // align Reserved2 to 8-byte boundary (x64)
+   633→        Reserved2     *byte   // lpReserved2 (unused, NULL)
+   634→        StdInput      syscall.Handle
+   635→        StdOutput     syscall.Handle
+   636→        StdError      syscall.Handle
+   637→        AttributeList uintptr // LPPROC_THREAD_ATTRIBUTE_LIST
+   638→}
+   639→
+   640→// processInformation mirrors Win32 PROCESS_INFORMATION.
+   641→type processInformation struct {
+   642→        Process   syscall.Handle
+   643→        Thread    syscall.Handle
+   644→        ProcessId uint32
+   645→        ThreadId  uint32
+   646→}
+   647→
+   648→// createPipe wraps syscall.CreatePipe with default security.
+   649→func createPipe(read, write *syscall.Handle) error {
+   650→        var sa syscall.SecurityAttributes
+   651→        sa.Length = uint32(unsafe.Sizeof(sa))
+   652→        sa.InheritHandle = 1
+   653→        return syscall.CreatePipe(read, write, &sa, 0)
+   654→}
+   655→

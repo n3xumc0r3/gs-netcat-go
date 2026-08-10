@@ -1,0 +1,59 @@
+v0.1.8: Fix multi-peer BAD_AUTH (reuse auth token) + sanitize binary garbage in error messages
+
+User reported three issues after v0.1.7:
+
+1. SERVER: "multi-peer: listen failed: gsrn: status FATAL BAD_AUTH: <binary garbage>"
+   Two consecutive BAD_AUTH errors after the first connection ended.
+
+2. CLIENT: "gs-netcat: gsrn: status FATAL CONNREFUSED: <binary garbage>"
+   Client couldn't connect because the server's re-listen was failing.
+
+3. BINARY GARBAGE in error messages — the status message field contained
+   non-printable bytes (relay sends binary data like session hashes) that
+   corrupted the terminal output.
+
+ROOT CAUSES:
+
+A. Binary garbage in errors:
+   StatusMsg() in internal/gsrn/gsrn.go returned raw bytes (offset 4..31
+   of the _gs_status packet) as a Go string without checking if they were
+   printable. When the relay sends binary data (session hash, token bytes,
+   etc.) in the message field, it appeared as garbage characters in the
+   terminal, potentially corrupting the console state.
+
+   FIX: StatusMsg() now checks if all bytes are printable ASCII (0x20..0x7e).
+   If any byte is non-printable, the message is returned as "hex:<hex>"
+   instead of raw bytes. This prevents terminal corruption while still
+   providing diagnostic info.
+
+B. BAD_AUTH on re-listen:
+   The multi-peer loop (cmd/gs-netcat/multipeer.go) re-called
+   gsconn.Dial(ModeListen) after each connection ended. gsconn.Dial
+   generates a NEW random 16-byte auth-token on every call (when
+   opts.AuthToken is empty). The relay still had the OLD token registered
+   for the same GS-Address, so it rejected the new listen with BAD_AUTH.
+
+   FIX: In runMultiPeerInteractiveServer, if opts.AuthToken is empty we
+   set it to the secret string. gsconn.Dial then calls
+   DeriveAuthToken(secret, addr) which is DETERMINISTIC — same secret +
+   same addr = same token. All re-listen attempts now use the SAME token,
+   so the relay accepts them.
+
+C. Fixed 2-second retry wasn't enough:
+   The old code slept a fixed 2 seconds between re-listen retries. The
+   relay's session cleanup window can be longer than 2s, causing repeated
+   BAD_AUTH failures.
+
+   FIX: Exponential backoff (1s, 2s, 4s, 8s, ..., capped at 30s) with
+   reset on success. Also added a 500ms delay after each connection ends
+   to give the relay a moment to clean up before re-listen.
+
+Other v0.1.8 changes:
+  - versioninfo.json: bumped to 0.1.8.0
+  - resource_windows_amd64.syso: regenerated
+
+Verified:
+  - Cross-compiled windows/amd64 binary: 3,568,640 bytes
+  - Contains VS_VERSION_INFO with "0.1.8.0" (UTF-16LE)
+  - All 4 platform binaries built clean
+  - Archives are proper ZIP (Windows) / tar.gz (Linux, macOS)

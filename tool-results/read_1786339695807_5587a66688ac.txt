@@ -1,0 +1,856 @@
+     1→// Package gsconn glues together gsrn (relay protocol), tlssrp (TLS-SRP
+     2→// over the relayed connection), and gspkt (in-band multiplexing) into a
+     3→// single high-level API: give it a secret, get back a secure
+     4→// io.ReadWriteCloser to the remote peer — optionally with multiplexed
+     5→// in-band signalling.
+     6→//
+     7→// Typical use (raw byte stream — cat mode, default):
+     8→//
+     9→//      conn, err := gsconn.Dial(secret, gsconn.ModeConnect, &gsconn.Options{
+    10→//          RelayHost: "127.0.0.1",
+    11→//          RelayPort: 4433,
+    12→//      })
+    13→//      if err != nil { ... }
+    14→//      defer conn.Close()
+    15→//      io.Copy(conn, os.Stdin)
+    16→//
+    17→// In-band multiplexing mode (mirrors gs-netcat -i): set UseInBand=true
+    18→// and start an event-pump goroutine to handle PING/LOG/etc. events:
+    19→//
+    20→//      opts.UseInBand = true
+    21→//      conn, _ := gsconn.Dial(secret, gsconn.ModeConnect, opts)
+    22→//      go func() {
+    23→//          for ev := range conn.Events() {
+    24→//              switch ev.Type {
+    25→//              case gspkt.MsgPING:
+    26→//                  _ = conn.WriteMsg(gspkt.MsgPONG, makePongPayload())
+    27→//              }
+    28→//          }
+    29→//      }()
+    30→//
+    31→// The two peers (ModeListen + ModeConnect) end up with an end-to-end
+    32→// TLS-SRP-secured channel routed through the GSRN relay.  Neither the
+    33→// relay nor any on-path observer learns the secret; both peers derive
+    34→// identical SRP credentials from the shared secret and TLS-SRP authenticates
+    35→// them to each other.
+    36→package gsconn
+    37→
+    38→import (
+    39→        "crypto/rand"
+    40→        "errors"
+    41→        "fmt"
+    42→        "io"
+    43→        "net"
+    44→        "os"
+    45→        "sync"
+    46→        "time"
+    47→
+    48→        "github.com/gsport/gs-netcat/internal/gskdf"
+    49→        "github.com/gsport/gs-netcat/internal/gspkt"
+    50→        "github.com/gsport/gs-netcat/internal/gsrn"
+    51→        "github.com/gsport/gs-netcat/internal/strs"
+    52→        "github.com/gsport/gs-netcat/internal/tlssrp"
+    53→)
+    54→
+    55→// Mode selects whether the local peer is the listener (LC) or connector (CC).
+    56→//
+    57→// The relay assigns SSL roles based on registration order: the LC (first
+    58→// to register) becomes the SSL server, the CC (second) becomes the SSL
+    59→// client.  The -A CLI flag (FlagClientOrServer) flips this so either peer
+    60→// can be the SSL server.
+    61→type Mode int
+    62→
+    63→const (
+    64→        ModeListen  Mode = iota // be the listener (LC)
+    65→        ModeConnect             // be the connector (CC)
+    66→)
+    67→
+    68→// Options configures a gsconn.Dial call.
+    69→type Options struct {
+    70→        // RelayHost:Port is the GSRN relay endpoint.  REQUIRED.
+    71→        // For the production gsocket.org relay, see RelayHostnameForAddr().
+    72→        RelayHost string
+    73→        RelayPort int
+    74→
+    75→        // AuthToken, if non-empty, sets a deterministic auth-token (the `-a`
+    76→        // CLI flag).  If empty, a random 16-byte token is generated (default).
+    77→        AuthToken string
+    78→
+    79→        // FlagExtra is OR'd into the protocol flags sent on the wire.
+    80→        // Defaults: ModeListen sends 0x00; ModeConnect sends 0x04 (FAST_CONNECT).
+    81→        // Pass FlagClientOrServer here for the -A flag.
+    82→        FlagExtra byte
+    83→
+    84→        // HandshakeTimeout bounds the total time spent in Dial() (GSRN +
+    85→        // TLS-SRP).  Zero = 30 seconds.
+    86→        HandshakeTimeout time.Duration
+    87→
+    88→        // PingInterval, if non-zero, runs a background keepalive goroutine.
+    89→        // Without keepalive most consumer NATs kill the TCP connection after
+    90→        // ~60 seconds of idle.  Default = 45 seconds.
+    91→        //
+    92→        // In raw (cat) mode the pinger is a no-op stub: GSRN-level pings
+    93→        // cannot be sent through a TLS-owned TCP stream without corrupting
+    94→        // TLS framing, so TCP keepalive (enabled on the relay socket) is
+    95→        // what actually preserves the connection. In in-band mode
+    96→        // (UseInBand=true) the pinger sends a gspkt.MsgPING every
+    97→        // PingInterval and is the real application-level keepalive.
+    98→        PingInterval time.Duration
+    99→
+   100→        // UseInBand enables in-band multiplexing (mirrors gs-netcat -i):
+   101→        // Writes are escape-encoded (0xFB doubled) and a gspkt.Decoder is
+   102→        // attached to Read so that in-band events (PING/LOG/etc.) are
+   103→        // extracted from the data stream and delivered via Conn.Events().
+   104→        //
+   105→        // When UseInBand is false (default), Read/Write pass raw bytes
+   106→        // through unchanged (cat mode — compatible with gs-netcat without
+   107→        // -i on the other side).
+   108→        //
+   109→        // Both peers MUST agree on this setting: an in-band peer talking to
+   110→        // a raw-mode peer will see escape-encoded bytes (with 0xFB doubled)
+   111→        // in its data stream.
+   112→        UseInBand bool
+   113→
+   114→        // NoEncryption mirrors the C `-C` flag: skip the TLS-SRP handshake
+   115→        // entirely and route raw application bytes through the GSRN relay.
+   116→        //
+   117→        // Wire compatibility: a NoEncryption peer can only talk to another
+   118→        // NoEncryption peer — the encrypted peer would try to parse the raw
+   119→        // bytes as a TLS record and fail. The GSRN relay itself is fine
+   120→        // with either mode (it sees only the GS-protocol packets + opaque
+   121→        // bytes after _gs_start).
+   122→        //
+   123→        // IMPORTANT: the relay can read all application data in this mode.
+   124→        // Only use when the network path is trusted or the data is not
+   125→        // sensitive.
+   126→        NoEncryption bool
+   127→
+   128→        // ServerCheck mirrors the C `-t` flag: ask the GSRN whether a
+   129→        // listener exists at this GS-Address, without establishing an
+   130→        // end-to-end connection. The relay responds with a _gs_status of
+   131→        // SERVER_OK (listener exists) or CONNREFUSED (no listener).
+   132→        //
+   133→        // Only valid with ModeConnect. When set, Dial returns immediately
+   134→        // after the relay's status response — no TLS handshake, no data
+   135→        // path. Use DialTest instead of Dial for this mode; Dial with
+   136→        // ServerCheck set returns an error.
+   137→        ServerCheck bool
+   138→}
+   139→
+   140→// DefaultOptions returns a sane starting point.
+   141→func DefaultOptions(host string, port int) *Options {
+   142→        return &Options{
+   143→                RelayHost:        host,
+   144→                RelayPort:        port,
+   145→                HandshakeTimeout: 30 * time.Second,
+   146→                PingInterval:     gsrn.DefaultPingInterval,
+   147→        }
+   148→}
+   149→
+   150→// Conn is a high-level GS connection: a TLS-SRP-secured channel routed
+   151→// through the GSRN relay.  It implements net.Conn (via the embedded
+   152→// *tlssrp.Conn) and adds a Close that also tears down the keepalive
+   153→// goroutine.
+   154→//
+   155→// When Options.UseInBand is true, Read and Write transparently run the
+   156→// gspkt in-band multiplexing protocol: data Writes are escape-encoded,
+   157→// data Reads are decoded (with in-band events extracted to Events()).
+   158→// Use WriteMsg/WriteChn to send in-band signalling packets.
+   159→type Conn struct {
+   160→        // rawConn is the underlying data channel: either *tlssrp.Conn
+   161→        // (encrypted mode) or net.Conn (NoEncryption / -C mode). It is
+   162→        // exposed via the embedded io.ReadWriteCloser interface so the
+   163→        // rest of the code (Read/Write/Close/SetDeadline) works
+   164→        // uniformly regardless of whether TLS is in front.
+   165→        rawConn  io.ReadWriteCloser
+   166→        relay    *gsrn.Conn
+   167→        creds    *gskdf.Credentials
+   168→        role     gsrn.Role
+   169→        mode     Mode
+   170→        stopPing chan struct{}
+   171→
+   172→        // in-band multiplexing state (nil when UseInBand is false).
+   173→        // pktMu protects ib's decoder/dataBuf/proto fields; the events
+   174→        // channel is safe for concurrent receive without the mutex.
+   175→        pktMu sync.Mutex
+   176→        ib    *inBand
+   177→
+   178→        // closeMu guards closeHooks and closed. closed ensures Close
+   179→        // (and the hooks) run at most once even if Close is called
+   180→        // concurrently from multiple goroutines (e.g. user-initiated
+   181→        // shutdown + remote-closed detection).
+   182→        //
+   183→        // OnClose hooks registered after Close has already run are
+   184→        // invoked immediately (so cleanup still happens — important
+   185→        // for the gsids unsubscribe path).
+   186→        closeMu    sync.Mutex
+   187→        closed     bool
+   188→        closeHooks []func()
+   189→}
+   190→
+   191→// Read reads decoded application data from the connection.
+   192→//
+   193→// In raw (cat) mode this is a direct passthrough to the underlying TLS
+   194→// connection. In in-band mode (Options.UseInBand) the bytes are first
+   195→// run through the gspkt decoder: literal 0xFB is un-doubled and any
+   196→// in-band packets (PING/LOG/channel streams) are extracted to the
+   197→// Events() channel.
+   198→//
+   199→// Returns 0 bytes + error on EOF or protocol error.
+   200→func (c *Conn) Read(p []byte) (int, error) {
+   201→        if c.ib == nil {
+   202→                return c.rawConn.Read(p)
+   203→        }
+   204→        return c.inBandRead(p)
+   205→}
+   206→
+   207→// Write writes application data to the connection.
+   208→//
+   209→// In raw (cat) mode this is a direct passthrough. In in-band mode the
+   210→// data is escape-encoded (every 0xFB doubled) so a literal 0xFB cannot
+   211→// be mistaken for the start of an in-band packet on the peer side.
+   212→//
+   213→// Use WriteMsg / WriteChn to send in-band signalling packets.
+   214→func (c *Conn) Write(p []byte) (int, error) {
+   215→        if c.ib == nil {
+   216→                return c.rawConn.Write(p)
+   217→        }
+   218→        return c.inBandWrite(p)
+   219→}
+   220→
+   221→// Creds returns the derived credentials.  Useful for logging the GS-Address.
+   222→func (c *Conn) Creds() *gskdf.Credentials { return c.creds }
+   223→
+   224→// Role returns the SSL role the relay assigned to us.
+   225→func (c *Conn) Role() gsrn.Role { return c.role }
+   226→
+   227→// Mode returns the local Mode (listen or connect).
+   228→func (c *Conn) Mode() Mode { return c.mode }
+   229→
+   230→// SetDeadline sets the read and write deadlines on the underlying
+   231→// connection (TLS or raw TCP). It mirrors net.Conn.SetDeadline. In
+   232→// NoEncryption mode it delegates to *net.TCPConn; in encrypted mode
+   233→// it delegates to *tlssrp.Conn (which forwards to the underlying TCP).
+   234→// Returns an error if the underlying type does not support deadlines.
+   235→func (c *Conn) SetDeadline(t time.Time) error {
+   236→        if d, ok := c.rawConn.(interface{ SetDeadline(time.Time) error }); ok {
+   237→                return d.SetDeadline(t)
+   238→        }
+   239→        return errors.New("gsconn: SetDeadline not supported by underlying conn")
+   240→}
+   241→
+   242→// SetReadDeadline sets the read deadline on the underlying connection.
+   243→func (c *Conn) SetReadDeadline(t time.Time) error {
+   244→        if d, ok := c.rawConn.(interface{ SetReadDeadline(time.Time) error }); ok {
+   245→                return d.SetReadDeadline(t)
+   246→        }
+   247→        return errors.New("gsconn: SetReadDeadline not supported by underlying conn")
+   248→}
+   249→
+   250→// SetWriteDeadline sets the write deadline on the underlying connection.
+   251→func (c *Conn) SetWriteDeadline(t time.Time) error {
+   252→        if d, ok := c.rawConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+   253→                return d.SetWriteDeadline(t)
+   254→        }
+   255→        return errors.New("gsconn: SetWriteDeadline not supported by underlying conn")
+   256→}
+   257→
+   258→// CloseWrite performs a half-close of the write side of the connection.
+   259→// In encrypted mode it delegates to *tlssrp.Conn.CloseWrite (which sends
+   260→// a TLS close_notify and shuts down the TCP write side). In NoEncryption
+   261→// mode it delegates to *net.TCPConn.CloseWrite (sends TCP FIN).
+   262→//
+   263→// Returns an error if the underlying type does not support half-close.
+   264→func (c *Conn) CloseWrite() error {
+   265→        if cw, ok := c.rawConn.(interface{ CloseWrite() error }); ok {
+   266→                return cw.CloseWrite()
+   267→        }
+   268→        return errors.New("gsconn: CloseWrite not supported by underlying conn")
+   269→}
+   270→
+   271→// Dial connects to the GSRN relay, completes the _gs_listen/_gs_connect
+   272→// handshake, waits for _gs_start, performs the TLS-SRP handshake, and
+   273→// returns a *Conn ready for application data.
+   274→//
+   275→// Both peers call Dial() with the same secret; one passes ModeListen,
+   276→// the other ModeConnect.  The relay matches them by GS-Address.
+   277→//
+   278→// If opts.NoEncryption is set (the -C flag), the TLS-SRP handshake is
+   279→// skipped and raw bytes flow through the relay. See Options.NoEncryption
+   280→// for wire-compatibility caveats.
+   281→//
+   282→// opts.ServerCheck is rejected here — use DialTest for the -t mode.
+   283→func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
+   284→        if opts == nil {
+   285→                return nil, errors.New("gsconn: nil Options")
+   286→        }
+   287→        if opts.ServerCheck {
+   288→                return nil, errors.New("gsconn: ServerCheck set; use DialTest instead")
+   289→        }
+   290→        if opts.RelayHost == "" {
+   291→                return nil, errors.New("gsconn: RelayHost is required")
+   292→        }
+   293→        if opts.RelayPort == 0 {
+   294→                opts.RelayPort = gsrn.DefaultPort
+   295→        }
+   296→        if opts.HandshakeTimeout == 0 {
+   297→                opts.HandshakeTimeout = 30 * time.Second
+   298→        }
+   299→
+   300→        creds := gskdf.Derive(secret)
+   301→
+   302→        // For listener mode, precompute the SRP verifier in the background
+   303→        // BEFORE the relay handshake starts. The verifier computation
+   304→        // (g^x mod N for 4096-bit N) takes ~100-500ms on Go's math/big,
+   305→        // and C gs-netcat connectors time out in <1 sec if the server
+   306→        // doesn't respond with ServerHello quickly enough. By starting the
+   307→        // computation now (before we even register with the relay), the
+   308→        // verifier will be ready by the time a connector connects.
+   309→        // (For connect mode we're the TLS client, no verifier needed.)
+   310→        var serverLookup *onTheFlyLookup
+   311→        if mode == ModeListen {
+   312→                serverLookup = &onTheFlyLookup{
+   313→                        user:     gskdf.SRPUsername,
+   314→                        password: creds.SRPPassword,
+   315→                        group:    &tlssrp.SRPGroup4096,
+   316→                }
+   317→                // Kick off the precomputation immediately.
+   318→                go serverLookup.ensurePrecomputed()
+   319→        }
+   320→
+   321→        // Build the GSRN options.
+   322→        gopts := &gsrn.Options{
+   323→                RelayHost:    opts.RelayHost,
+   324→                RelayPort:    opts.RelayPort,
+   325→                Flags:        opts.FlagExtra,
+   326→                PingInterval: 0, // we'll handle keepalive at this layer
+   327→        }
+   328→
+   329→        // Auth-token policy:
+   330→        //   ModeListen with AuthToken=""  → random 16 bytes (default behaviour)
+   331→        //   ModeListen with AuthToken="x" → DeriveAuthToken("x", addr)
+   332→        //   ModeConnect                   → token field NOTUSED (left zero)
+   333→        if mode == ModeListen {
+   334→                if opts.AuthToken != "" {
+   335→                        gopts.Token = gskdf.DeriveAuthToken(opts.AuthToken, creds.Address)
+   336→                } else {
+   337→                        t, err := gskdf.GenRandomToken()
+   338→                        if err != nil {
+   339→                                return nil, fmt.Errorf("gsconn: gen token: %w", err)
+   340→                        }
+   341→                        gopts.Token = t
+   342→                }
+   343→        }
+   344→
+   345→        // Dial the relay with the listen/connect packet.
+   346→        relay, err := gsrn.Dial(creds.Address, mode == ModeListen, gopts)
+   347→        if err != nil {
+   348→                return nil, err
+   349→        }
+   350→
+   351→        // Enable TCP keepalive on the relay socket so consumer NATs don't
+   352→        // drop the long-lived relay connection during idle periods.
+   353→        // GSRN-level ping/pong is NOT used because writing raw 32-byte GSRN
+   354→        // packets into a TCP stream that the TLS layer thinks it owns corrupts
+   355→        // TLS framing. Real gs-netcat multiplexes pings via an out-of-band
+   356→        // mechanism (lib/packet.c escape-byte protocol) that runs *inside* TLS,
+   357→        // which the Go port does not implement in v1. TCP keepalive achieves
+   358→        // the same NAT-preservation effect without touching TLS framing.
+   359→        if tc, ok := relay.Conn.(*net.TCPConn); ok {
+   360→                _ = tc.SetKeepAlive(true)
+   361→                _ = tc.SetKeepAlivePeriod(30 * time.Second)
+   362→        }
+   363→
+   364→        // Set handshake deadline on the underlying TCP.
+   365→        _ = relay.SetDeadline(time.Now().Add(opts.HandshakeTimeout))
+   366→
+   367→        // Pipeline optimization: build the TLS config in parallel with
+   368→        // waiting for _gs_start. buildTLSConfig itself is O(1) but the
+   369→        // server-side onTheFlyLookup.ensurePrecomputed() (kicked off
+   370→        // above) is the expensive part — for client mode this is just
+   371→        // struct assembly. Running it concurrently with the relay
+   372→        // round-trip shaves one RTT off the total handshake latency
+   373→        // when the relay is slow (e.g. cross-continent).
+   374→        //
+   375→        // FAST_CONNECT note: even with FAST_CONNECT set on the wire
+   376→        // (default for CONNECT), the C original ALWAYS waits for
+   377→        // _gs_start locally (gsocket-engine.c never reads the flag for
+   378→        // local logic — see header comment in gsrn/flags.go). We do the
+   379→        // same: Start() blocks for _gs_start regardless of FAST_CONNECT.
+   380→        type tlsResult struct {
+   381→                cfg *tlssrp.Config
+   382→                err error
+   383→        }
+   384→        tlsCh := make(chan tlsResult, 1)
+   385→        go func() {
+   386→                cfg, err := buildTLSConfig(creds, gsrn.RoleUnassigned, serverLookup)
+   387→                // role isn't known yet; buildTLSConfig only uses it to decide
+   388→                // whether to install SRPLookup. We pass RoleUnassigned and
+   389→                // re-install SRPLookup below if we end up as server.
+   390→                tlsCh <- tlsResult{cfg, err}
+   391→        }()
+   392→
+   393→        // Wait for _gs_start to tell us our SSL role.
+   394→        tStart := time.Now()
+   395→        role, err := relay.Start()
+   396→        if err != nil {
+   397→                relay.Close()
+   398→                return nil, err
+   399→        }
+   400→        if os.Getenv("GSPORT_DEBUG") != "" {
+   401→                fmt.Fprintf(os.Stderr, "[gsport] role assigned: %v (after %v)\n", role, time.Since(tStart))
+   402→        }
+   403→
+   404→        // Acknowledge the role assignment.
+   405→        tAccept := time.Now()
+   406→        if err := relay.SendAccept(); err != nil {
+   407→                relay.Close()
+   408→                return nil, fmt.Errorf("gsconn: send accept: %w", err)
+   409→        }
+   410→        if os.Getenv("GSPORT_DEBUG") != "" {
+   411→                fmt.Fprintf(os.Stderr, "[gsport] accept sent (after %v)\n", time.Since(tAccept))
+   412→        }
+   413→
+   414→        // Clear the deadline — application data flows under no deadline
+   415→        // (caller may set its own via SetDeadline).
+   416→        _ = relay.SetDeadline(time.Time{})
+   417→
+   418→        // -C (NoEncryption): skip TLS-SRP entirely. The relay TCP is the
+   419→        // data channel. rawConn is the relay net.Conn directly, so all
+   420→        // Read/Write/Close paths work uniformly with the encrypted mode.
+   421→        if opts.NoEncryption {
+   422→                // Drain the parallel TLS-config goroutine so it doesn't
+   423→                // leak (it has already done its work; we just need to
+   424→                // receive from the buffered channel).
+   425→                <-tlsCh
+   426→                if os.Getenv("GSPORT_DEBUG") != "" {
+   427→                        fmt.Fprintf(os.Stderr, "%s", strs.Decode([]byte{0x9f, 0xa3, 0xb7, 0xb4, 0xab, 0xb6, 0xb0, 0x99, 0xe4, 0x8a, 0xab, 0x81, 0xaa, 0xa7, 0xb6, 0xbd, 0xb4, 0xb0, 0xad, 0xab, 0xaa, 0xe4, 0xa9, 0xab, 0xa0, 0xa1, 0xe4, 0x26, 0x44, 0x50, 0xe4, 0xb7, 0xaf, 0xad, 0xb4, 0xb4, 0xad, 0xaa, 0xa3, 0xe4, 0x90, 0x88, 0x97, 0xe9, 0x97, 0x96, 0x94, 0xe4, 0xac, 0xa5, 0xaa, 0xa0, 0xb7, 0xac, 0xa5, 0xaf, 0xa1}, 0xc4))
+   428→                }
+   429→                c := &Conn{
+   430→                        rawConn:  relay.Conn,
+   431→                        relay:    relay,
+   432→                        creds:    creds,
+   433→                        role:     role,
+   434→                        mode:     mode,
+   435→                        stopPing: make(chan struct{}),
+   436→                }
+   437→                if opts.UseInBand {
+   438→                        c.ib = newInBand()
+   439→                }
+   440→                if opts.PingInterval > 0 {
+   441→                        if opts.UseInBand && c.role == gsrn.RoleClient {
+   442→                                go c.inBandPinger(opts.PingInterval)
+   443→                        } else {
+   444→                                go c.pingerStub(opts.PingInterval)
+   445→                        }
+   446→                }
+   447→                return c, nil
+   448→        }
+   449→
+   450→        // Pick up the TLS config built in parallel. If it errored, bail now.
+   451→        tres := <-tlsCh
+   452→        if tres.err != nil {
+   453→                relay.Close()
+   454→                return nil, tres.err
+   455→        }
+   456→        tlsCfg := tres.cfg
+   457→        // buildTLSConfig ran with RoleUnassigned; install the SRP lookup
+   458→        // if we ended up as server.
+   459→        if role == gsrn.RoleServer && serverLookup != nil {
+   460→                tlsCfg.SRPLookup = serverLookup
+   461→        }
+   462→
+   463→        // Wrap the relay TCP with the right TLS role.
+   464→        var tlsConn *tlssrp.Conn
+   465→        switch role {
+   466→        case gsrn.RoleServer:
+   467→                tlsConn = tlssrp.Server(relay.Conn, tlsCfg)
+   468→        case gsrn.RoleClient:
+   469→                tlsConn = tlssrp.Client(relay.Conn, tlsCfg)
+   470→        default:
+   471→                relay.Close()
+   472→                return nil, fmt.Errorf("gsconn: invalid role %v", role)
+   473→        }
+   474→        if os.Getenv("GSPORT_DEBUG") != "" {
+   475→                fmt.Fprintf(os.Stderr, "[gsport] starting TLS handshake as %v (total since Start: %v)\n", role, time.Since(tStart))
+   476→        }
+   477→
+   478→        // Run the TLS-SRP handshake.
+   479→        tHandshake := time.Now()
+   480→        if err := tlsConn.Handshake(); err != nil {
+   481→                relay.Close()
+   482→                return nil, fmt.Errorf(strs.Decode([]byte{0xf1, 0xe5, 0xf5, 0xf9, 0xf8, 0xf8, 0xac, 0xb6, 0xc2, 0xda, 0xc5, 0xbb, 0xc5, 0xc4, 0xc6, 0xb6, 0xfe, 0xf7, 0xf8, 0xf2, 0xe5, 0xfe, 0xf7, 0xfd, 0xf3, 0xb6, 0xbe, 0xf0, 0xf7, 0xff, 0xfa, 0xf3, 0xf2, 0xb6, 0xf7, 0xf0, 0xe2, 0xf3, 0xe4, 0xb6, 0xb3, 0xe0, 0xbf, 0xac, 0xb6, 0xb3, 0xe1}, 0x96), time.Since(tHandshake), err) //nolint:govet // dynamic format string is intentional for AV-FP mitigation
+   483→        }
+   484→        if os.Getenv("GSPORT_DEBUG") != "" {
+   485→                fmt.Fprintf(os.Stderr, "[gsport] TLS handshake completed (took %v)\n", time.Since(tHandshake))
+   486→        }
+   487→
+   488→        c := &Conn{
+   489→                rawConn:  tlsConn,
+   490→                relay:    relay,
+   491→                creds:    creds,
+   492→                role:     role,
+   493→                mode:     mode,
+   494→                stopPing: make(chan struct{}),
+   495→        }
+   496→        if opts.UseInBand {
+   497→                c.ib = newInBand()
+   498→        }
+   499→
+   500→        // Optionally start keepalive pinger.
+   501→        //
+   502→        // In in-band mode this sends a real gspkt.MsgPING every PingInterval
+   503→        // — that is the application-level keepalive the C original uses
+   504→        // (lib/packet.c multiplexes pings *inside* the TLS stream, so they
+   505→        // do not corrupt TLS framing). The peer's decoder extracts the PING
+   506→        // and the peer's event-pump is expected to reply with PONG.
+   507→        //
+   508→        // In raw (cat) mode this is a no-op stub: writing raw GSRN pings or
+   509→        // gspkt pings into a TLS-owned stream without an in-band decoder on
+   510→        // the peer side would either corrupt TLS framing (GSRN pings) or
+   511→        // appear as junk bytes in the peer's data stream (gspkt pings). TCP
+   512→        // keepalive (enabled on the relay socket in Dial) substitutes.
+   513→        if opts.PingInterval > 0 {
+   514→                if opts.UseInBand && c.role == gsrn.RoleClient {
+   515→                        // In in-band mode the connector (SSL-client) sends PING
+   516→                        // every interval; the listener (SSL-server) replies with
+   517→                        // PONG via the event-pump. Mirrors the C original where
+   518→                        // cb_periodic_ping is armed only when is_interactive &&
+   519→                        // !is_server.
+   520→                        go c.inBandPinger(opts.PingInterval)
+   521→                } else {
+   522→                        // Raw mode OR listener in in-band mode: no app-level
+   523→                        // ping. NAT preservation falls back to TCP keepalive
+   524→                        // (enabled on the relay socket in Dial).
+   525→                        go c.pingerStub(opts.PingInterval)
+   526→                }
+   527→        }
+   528→
+   529→        return c, nil
+   530→}
+   531→
+   532→// OnClose registers a function to be called when Conn.Close is
+   533→// invoked. Multiple hooks may be registered; they run in registration
+   534→// order. Hooks are called at most once per registration.
+   535→//
+   536→// This is used by main.go's MsgIDS handler to register the gsids
+   537→// unsubscribe callback so IDS subscriptions are cleaned up when the
+   538→// conn terminates.
+   539→//
+   540→// If Close has already run by the time OnClose is called, fn is
+   541→// invoked immediately (synchronously, on the calling goroutine) so
+   542→// cleanup semantics are preserved regardless of registration timing.
+   543→func (c *Conn) OnClose(fn func()) {
+   544→        c.closeMu.Lock()
+   545→        if c.closed {
+   546→                c.closeMu.Unlock()
+   547→                fn()
+   548→                return
+   549→        }
+   550→        c.closeHooks = append(c.closeHooks, fn)
+   551→        c.closeMu.Unlock()
+   552→}
+   553→
+   554→// runCloseHooks invokes all registered close hooks in registration
+   555→// order. Called exactly once by Close. Hooks are extracted under
+   556→// closeMu and then invoked WITHOUT the lock held (so hooks can call
+   557→// back into Conn methods that acquire closeMu if needed).
+   558→func (c *Conn) runCloseHooks() {
+   559→        c.closeMu.Lock()
+   560→        hooks := c.closeHooks
+   561→        c.closeHooks = nil
+   562→        c.closed = true
+   563→        c.closeMu.Unlock()
+   564→        for _, fn := range hooks {
+   565→                fn()
+   566→        }
+   567→}
+   568→
+   569→// Close tears down the connection and stops the keepalive goroutine.
+   570→// Idempotent: subsequent calls are no-ops (runCloseHooks is only run
+   571→// once thanks to the closed flag).
+   572→func (c *Conn) Close() error {
+   573→        c.closeMu.Lock()
+   574→        if c.closed {
+   575→                c.closeMu.Unlock()
+   576→                return nil
+   577→        }
+   578→        c.closeMu.Unlock()
+   579→        c.runCloseHooks()
+   580→
+   581→        select {
+   582→        case <-c.stopPing:
+   583→                // already closed
+   584→        default:
+   585→                close(c.stopPing)
+   586→        }
+   587→        // tlssrp.Conn.Close() will close the underlying relay TCP.
+   588→        err := c.rawConn.Close()
+   589→        // Drain and close the events channel so the event-pump goroutine
+   590→        // (if any) can exit its range loop. Close is the only writer to
+   591→        // c.ib.events (Read pushes are also from this Conn's owner); we
+   592→        // take care to close only once via stopPing's once-semantics.
+   593→        if c.ib != nil {
+   594→                // Mark proto as closed to short-circuit further Read calls.
+   595→                c.pktMu.Lock()
+   596→                c.ib.proto = io.EOF
+   597→                c.pktMu.Unlock()
+   598→                // Closing the events channel is unsafe if a Read is still
+   599→                // running (it would panic on send-to-closed). The caller
+   600→                // MUST stop reading before Close. To be safe, we do NOT
+   601→                // close the channel; instead the event-pump's range loop
+   602→                // will exit when it sees the conn's reader goroutine has
+   603→                // ended (typical pattern: select on Events() and ctx.Done()).
+   604→        }
+   605→        return err
+   606→}
+   607→
+   608→// pingerStub is a no-op placeholder for the keepalive goroutine in raw
+   609→// (cat) mode. It exists so that the API is uniform across modes; for
+   610→// raw mode it simply waits on stopPing and exits, leaving NAT
+   611→// preservation to TCP keepalive (enabled in Dial).
+   612→func (c *Conn) pingerStub(interval time.Duration) {
+   613→        t := time.NewTicker(interval)
+   614→        defer t.Stop()
+   615→        for {
+   616→                select {
+   617→                case <-c.stopPing:
+   618→                        return
+   619→                case <-t.C:
+   620→                        // no-op — TCP keepalive handles NAT preservation
+   621→                }
+   622→        }
+   623→}
+   624→
+   625→// inBandPinger is the keepalive goroutine for in-band mode. Every
+   626→// interval it sends a gspkt.MsgPING (16-byte payload, all zero —
+   627→// matching struct _pkt_app_ping with flags=0). The peer's event-pump is
+   628→// expected to reply with MsgPONG; we do NOT block waiting for the reply
+   629→// (fire-and-forget). The peer's PONG arrives as an Event via
+   630→// Conn.Events() for the application to display if it wants.
+   631→func (c *Conn) inBandPinger(interval time.Duration) {
+   632→        t := time.NewTicker(interval)
+   633→        defer t.Stop()
+   634→        payload := make([]byte, 16) // MsgPING = 16 bytes per gspkt.MsgSize
+   635→        for {
+   636→                select {
+   637→                case <-c.stopPing:
+   638→                        return
+   639→                case <-t.C:
+   640→                        if err := c.WriteMsg(gspkt.MsgPING, payload); err != nil {
+   641→                                if os.Getenv("GSPORT_DEBUG") != "" {
+   642→                                        fmt.Fprintf(os.Stderr, "[gsport] in-band ping write failed: %v\n", err)
+   643→                                }
+   644→                                return
+   645→                        }
+   646→                        if os.Getenv("GSPORT_DEBUG") != "" {
+   647→                                fmt.Fprintf(os.Stderr, "[gsport] in-band ping sent\n")
+   648→                        }
+   649→                }
+   650→        }
+   651→}
+   652→
+   653→// buildTLSConfig returns a *tlssrp.Config pinned to:
+   654→//   - TLS 1.2 (SRP was removed from TLS 1.3)
+   655→//   - Single ciphersuite: TLS_SRP_SHA_WITH_AES_256_CBC_SHA (0xC020)
+   656→//   - Group: 4096-bit (RFC 5054 §A.2 #3) — what gs-netcat uses
+   657→//   - Username: "user" (what gs-netcat hardcodes)
+   658→//   - Password: the wrapped SRP password from gskdf.Derive
+   659→//
+   660→// For server role, a Lookuper is installed that uses the precomputed
+   661→// verifier+salt (computed in background at Dial time). This mirrors
+   662→// gs-netcat's SRP_create_verifier_BN("user", pwd, &salt, &verifier, N, g)
+   663→// call but with the verifier cached for performance.
+   664→//
+   665→// Salt length is 20 bytes (matches OpenSSL's SRP_create_verifier_BN,
+   666→// confirmed in A5 wire capture).
+   667→func buildTLSConfig(creds *gskdf.Credentials, role gsrn.Role, lookup *onTheFlyLookup) (*tlssrp.Config, error) {
+   668→        cfg := &tlssrp.Config{
+   669→                // Pin TLS 1.2: SRP ciphersuites are not defined for TLS 1.3,
+   670→                // and TLS 1.0/1.1 are deprecated.
+   671→                MinVersion: tlssrp.VersionTLS12,
+   672→                MaxVersion: tlssrp.VersionTLS12,
+   673→
+   674→                // Single ciphersuite — what gs-netcat requests.
+   675→                CipherSuites: []uint16{tlssrp.TLS_SRP_SHA_WITH_AES_256_CBC_SHA},
+   676→
+   677→                // Disable session tickets — they make TLS-SRP pointless (the
+   678→                // ticket would let an attacker resume without the password).
+   679→                // gs-netcat doesn't use them either.
+   680→                SessionTicketsDisabled: true,
+   681→
+   682→                // SRP client side:
+   683→                SRPUser:     gskdf.SRPUsername, // "user"
+   684→                SRPPassword: creds.SRPPassword,
+   685→                SRPGroups:   []*tlssrp.SRPGroup{&tlssrp.SRPGroup4096},
+   686→
+   687→                // SRP server side (only used when role == RoleServer):
+   688→                SRPSaltKey:  "gsport-default-salt-key", // any non-empty string
+   689→                SRPSaltSize: gskdf.SaltLength,          // 20 — matches OpenSSL
+   690→        }
+   691→
+   692→        if role == gsrn.RoleServer && lookup != nil {
+   693→                cfg.SRPLookup = lookup
+   694→        }
+   695→
+   696→        return cfg, nil
+   697→}
+   698→
+   699→// onTheFlyLookup implements tlssrp.Lookuper by computing the verifier
+   700→// from the configured password on every Lookup call, mirroring what
+   701→// gs-netcat does (lib/gsocket-ssl.c uses SRP_create_verifier_BN inside
+   702→// the SRP_username_cb callback so the verifier is never stored).
+   703→//
+   704→// To keep interop latency low with C gs-netcat connectors (which time out
+   705→// in <1 sec if the server doesn't respond with ServerHello quickly enough),
+   706→// the verifier and salt are precomputed ONCE at construction time and
+   707→// reused for every connection. This is acceptable for v1 because:
+   708→//   - The verifier is never transmitted over the wire (only B = k*v + g^a).
+   709→//   - The salt is visible in ServerKeyExchange but with a known salt an
+   710→//     attacker still needs to solve DLP to recover the password.
+   711→//   - The risk is offline dictionary attack IF the attacker later
+   712→//     compromises the server and obtains the verifier — same risk as any
+   713→//     SRP deployment with a stored verifier file.
+   714→//
+   715→// A fresh salt+verifier per connection would be ideal (limits replay
+   716→// value of a compromised verifier to a single session) but requires
+   717→// either C-speed bigint math or a precomputed pool. Deferred to v1.1.
+   718→type onTheFlyLookup struct {
+   719→        user     string
+   720→        password string
+   721→        group    *tlssrp.SRPGroup
+   722→        // Precomputed material (computed once at construction):
+   723→        salt     []byte
+   724→        verifier []byte
+   725→        once     sync.Once
+   726→}
+   727→
+   728→func (l *onTheFlyLookup) ensurePrecomputed() {
+   729→        l.once.Do(func() {
+   730→                l.salt = make([]byte, gskdf.SaltLength)
+   731→                if _, err := rand.Read(l.salt); err != nil {
+   732→                        // extremely unlikely; fall back to deterministic salt
+   733→                        panic(fmt.Sprintf("gsconn: gen salt: %v", err))
+   734→                }
+   735→                l.verifier = tlssrp.SRPVerifier(l.user, l.password, l.salt, *l.group)
+   736→                if os.Getenv("GSPORT_DEBUG") != "" {
+   737→                        fmt.Fprintf(os.Stderr, "[gsport] precomputed verifier: salt=%d bytes, v=%d bytes\n",
+   738→                                len(l.salt), len(l.verifier))
+   739→                }
+   740→        })
+   741→}
+   742→
+   743→func (l *onTheFlyLookup) Lookup(user string) (v, s []byte, grp tlssrp.SRPGroup, err error) {
+   744→        if os.Getenv("GSPORT_DEBUG") != "" {
+   745→                fmt.Fprintf(os.Stderr, "[gsport] onTheFlyLookup: user=%q (expected %q)\n", user, l.user)
+   746→        }
+   747→        // gs-netcat only ever uses username "user".  We accept any username
+   748→        // and return a verifier for the configured password — the TLS-SRP
+   749→        // handshake will then succeed iff the client used the same password.
+   750→        // (mjl's library has its own user-enumeration protection: when v==nil
+   751→        // and s==nil but grp is non-zero, the server uses a fake salt+verifier
+   752→        // and produces a fake PMS so the handshake fails in a way that does
+   753→        // not reveal whether the username was valid.)
+   754→        if user != l.user {
+   755→                if os.Getenv("GSPORT_DEBUG") != "" {
+   756→                        fmt.Fprintf(os.Stderr, "[gsport] onTheFlyLookup: user mismatch — returning nil verifier\n")
+   757→                }
+   758→                return nil, nil, *l.group, nil
+   759→        }
+   760→
+   761→        // Use the precomputed verifier+salt. This keeps Lookup O(1) and lets
+   762→        // the TLS-SRP server respond with ServerHello + ServerKeyExchange
+   763→        // within milliseconds of receiving ClientHello — fast enough for
+   764→        // C gs-netcat's ~1-sec handshake timeout.
+   765→        l.ensurePrecomputed()
+   766→        return l.verifier, l.salt, *l.group, nil
+   767→}
+   768→
+   769→// RelayHostnameForAddr mirrors GS_ADDR_get_hostname_id (analysis §10.5):
+   770→//
+   771→//      sum(addr[0..15]) % 26 → [a-z].gs.thc.org
+   772→//
+   773→// This is how the production gsocket.org relay routes connections.
+   774→// Each GS-Address hashes to a specific relay hostname.
+   775→func RelayHostnameForAddr(addr gskdf.Addr) string {
+   776→        var sum int
+   777→        for _, b := range addr {
+   778→                sum += int(b)
+   779→        }
+   780→        letter := rune('a' + (sum % 26))
+   781→        return string(letter) + ".gs.thc.org"
+   782→}
+   783→
+   784→// noTLSConn is no longer needed — in NoEncryption mode we store the
+   785→// relay's net.Conn directly as rawConn (which is io.ReadWriteCloser).
+   786→// Kept as a no-op placeholder so the diff history is clear; safe to
+   787→// remove in a future cleanup.
+   788→//
+   789→// (No type alias needed; net.Conn already satisfies io.ReadWriteCloser
+   790→// via the concrete *net.TCPConn returned by gsrn.Dial.)
+   791→
+   792→// DialTest implements the -t (ServerCheck) mode: connect to the GSRN
+   793→// with FlagServerCheck set, wait for the relay's _gs_status response,
+   794→// and return it as a StatusError (or nil if the relay reported OK).
+   795→//
+   796→// This mirrors the C `is_try_server` path: the relay short-circuits
+   797→// the connection and returns SERVER_OK / CONNREFUSED / NETERROR
+   798→// without putting the peers in contact. No TLS handshake, no data
+   799→// path. The caller inspects the returned StatusError.Code to decide
+   800→// OK / NO / NET-ERROR for the human-readable output.
+   801→//
+   802→// `relayTimeout` bounds the entire operation (default 15s in C).
+   803→func DialTest(secret string, opts *Options, relayTimeout time.Duration) (status byte, err error) {
+   804→        if opts == nil {
+   805→                return 0, errors.New("gsconn: nil Options")
+   806→        }
+   807→        if opts.RelayHost == "" {
+   808→                return 0, errors.New("gsconn: RelayHost is required")
+   809→        }
+   810→        if opts.RelayPort == 0 {
+   811→                opts.RelayPort = gsrn.DefaultPort
+   812→        }
+   813→        if relayTimeout <= 0 {
+   814→                relayTimeout = 15 * time.Second
+   815→        }
+   816→
+   817→        creds := gskdf.Derive(secret)
+   818→
+   819→        // Force SERVER_CHECK on the wire.
+   820→        gopts := &gsrn.Options{
+   821→                RelayHost: opts.RelayHost,
+   822→                RelayPort: opts.RelayPort,
+   823→                Flags:     opts.FlagExtra | gsrn.FlagServerCheck,
+   824→        }
+   825→        // Auth token is irrelevant for SERVER_CHECK (the relay doesn't
+   826→        // match peers), but we send a zero token to match the wire format.
+   827→        relay, err := gsrn.Dial(creds.Address, false, gopts)
+   828→        if err != nil {
+   829→                // Network-level failure (TCP to relay failed): NET-ERROR.
+   830→                return 0, err
+   831→        }
+   832→        defer relay.Close()
+   833→        _ = relay.SetDeadline(time.Now().Add(relayTimeout))
+   834→
+   835→        // Wait for the relay's response. With SERVER_CHECK set the relay
+   836→        // replies with _gs_status (SERVER_OK or CONNREFUSED) instead of
+   837→        // _gs_start.
+   838→        role, err := relay.Start()
+   839→        if err == nil {
+   840→                // Got _gs_start (no SERVER_CHECK support on this relay?).
+   841→                // Treat as OK — the relay accepted our connect, meaning a
+   842→                // peer is listening (otherwise we'd have gotten CONNREFUSED).
+   843→                _ = role
+   844→                return gsrn.StatusServerOK, nil
+   845→        }
+   846→        if se, ok := err.(gsrn.StatusError); ok {
+   847→                return se.Code, nil
+   848→        }
+   849→        // Timeout / other I/O error: NET-ERROR.
+   850→        return 0, err
+   851→}
+   852→
+   853→// silence unused-import warnings for io / net (kept for future use).
+   854→var _ = io.Copy
+   855→var _ net.Conn
+   856→

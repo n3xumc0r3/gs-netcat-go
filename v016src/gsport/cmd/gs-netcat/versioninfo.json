@@ -1,0 +1,43 @@
+{
+  "FixedFileInfo": {
+    "FileVersion": {
+      "Major": 0,
+      "Minor": 1,
+      "Patch": 9,
+      "Build": 0
+    },
+    "ProductVersion": {
+      "Major": 0,
+      "Minor": 1,
+      "Patch": 9,
+      "Build": 0
+    },
+    "FileFlagsMask": "3f",
+    "FileFlags": "00",
+    "FileOS": "040004",
+    "FileType": "01",
+    "FileSubType": "00"
+  },
+  "StringFileInfo": {
+    "Comments": "gs-netcat: encrypted GSRN relay pipe for secure remote shell and file transfer.",
+    "CompanyName": "n3xumc0r3",
+    "FileDescription": "gs-netcat - secure peer-to-peer relay pipe",
+    "FileVersion": "0.1.9.0",
+    "InternalName": "gs-netcat",
+    "LegalCopyright": "Copyright (c) 2026 n3xumc0r3",
+    "LegalTrademarks": "",
+    "OriginalFilename": "gs-netcat.exe",
+    "PrivateBuild": "",
+    "ProductName": "gs-netcat",
+    "ProductVersion": "0.1.9.0",
+    "SpecialBuild": ""
+  },
+  "VarFileInfo": {
+    "Translation": {
+      "LangID": "0409",
+      "CharsetID": "04b0"
+    }
+  },
+  "IconPath": "",
+  "ManifestPath": "/home/z/my-project/v016src/gsport/cmd/gs-netcat/app.manifest"
+}

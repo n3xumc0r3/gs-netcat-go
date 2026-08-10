@@ -1,0 +1,39 @@
+v0.1.6: Add EXTENDED_STARTUPINFO_PRESENT to dwCreationFlags — the REAL ConPTY fix
+
+v0.1.5 fixed the inverted HRESULT check in CreatePseudoConsole, so the
+ConPTY was created successfully and cmd.exe spawned. BUT the shell
+output appeared in the SERVER's window instead of being relayed to the
+client. The client just saw "Connected" with no shell.
+
+Root cause: EXTENDED_STARTUPINFO_PRESENT was set in STARTUPINFO.dwFlags
+(si.Flags) but NOT in the dwCreationFlags parameter of CreateProcessW.
+
+The Microsoft ConPTY sample sets this flag in BOTH places:
+  1. siEx.StartupInfo.dwFlags = EXTENDED_STARTUPINFO_PRESENT
+  2. dwCreationFlags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
+
+Without the flag in dwCreationFlags, CreateProcessW treats lpStartupInfo
+as a plain STARTUPINFOW (104 bytes) and silently ignores the
+lpAttributeList field at offset 104. The PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+entry is never applied, so the child process inherits the parent's
+console instead of attaching to the pseudoconsole.
+
+Result: cmd.exe ran in the server's PowerShell window (its stdin/stdout
+were wired to the parent's console handles), the ConPTY output pipe was
+empty, and io.Copy(conn, pty.Master) sent nothing to the client.
+
+The fix: add EXTENDED_STARTUPINFO_PRESENT to the dwCreationFlags
+parameter (6th arg) of CreateProcessW. Now CreateProcessW correctly
+interprets the STARTUPINFOEX and applies the pseudoconsole attribute,
+so the child attaches to the ConPTY and I/O flows through the pipe to
+the client.
+
+Other v0.1.6 changes:
+  - versioninfo.json: bumped to 0.1.6.0 (FileVersion + ProductVersion)
+  - resource_windows_amd64.syso: regenerated from the new versioninfo
+
+Verified:
+  - Cross-compiled windows/amd64 binary: 3,564,544 bytes, contains
+    VS_VERSION_INFO with "0.1.6.0" (UTF-16LE), "0.1.5.0" absent.
+  - The HRESULT error string from v0.1.5 is preserved.
+  - All 4 platform binaries built clean.

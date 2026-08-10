@@ -1,0 +1,42 @@
+# Compiled binaries (only at repo root, not in cmd/gs-netcat/ source dir!)
+/bin/
+/*.exe
+/*.dll
+/*.so
+/*.dylib
+/gs-netcat
+/gs-netcat.exe
+/gs-netcat_*
+
+# Test artifacts
+*.out
+*.err
+*.tmp
+/tmp/gsport_*
+
+# Local development
+.env
+.env.local
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# SSH keys — NEVER commit
+.ssh/
+*.pem
+id_ed25519
+id_rsa
+*_rsa
+*_ed25519
+
+# Go workspace scratch
+vendor/
+go.work
+go.work.sum
+
+# OS junk
+Thumbs.db
+desktop.ini

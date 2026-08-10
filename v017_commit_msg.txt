@@ -1,0 +1,58 @@
+v0.1.7: Use Windows Job Object to kill entire process tree on Close — fixes "More?" bug
+
+After v0.1.6, the shell was correctly relayed to the client. BUT when the
+client disconnected, the shell process tree (cmd.exe + any children like
+powershell.exe) was NOT killed. The orphaned processes reattached to the
+server's console window, stealing keyboard input and producing weird
+"More?" prompts and garbage characters.
+
+User report (v0.1.6):
+  PS> .\gs-netcat.exe -s "user1448" -i -l
+  ...
+  C:\Users\Артём\Desktop>
+  More? Users\Артём\Desktop>
+  PS C:\Users\Артём\Desktop> More?
+  PS C:\Users\Артём\Desktop> ссссссMore?
+
+Root cause: Close() called ClosePseudoConsole (which releases the
+pseudoconsole resources) but did NOT kill the child processes.
+TerminateProcess only kills the immediate child (cmd.exe), not its
+children (powershell.exe, wsl.exe, etc.). The orphaned children
+reattached to the parent's console and intercepted keystrokes.
+
+Fix: use a Windows Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+
+When the job handle is closed, ALL processes in the job — the immediate
+child AND any grandchildren — are terminated immediately. This is the
+ONLY reliable way to clean up a process tree on Windows.
+
+Implementation:
+  1. Added CREATE_SUSPENDED flag to CreateProcessW — starts the child
+     suspended so we can assign it to the job BEFORE it runs any code.
+  2. Create a Job Object with KILL_ON_JOB_CLOSE.
+  3. Assign the suspended child to the job.
+  4. ResumeThread — the child starts running, now inside the job.
+     Any grandchildren it spawns are also in the job.
+  5. Store hJob in the PTY struct.
+  6. In Close(), close hJob FIRST (before ClosePseudoConsole) — this
+     kills the entire process tree before the ConPTY is torn down,
+     preventing any process from reattaching to the parent's console.
+
+New Windows API calls added:
+  - CreateJobObjectW
+  - SetInformationJobObject (with JobObjectExtendedLimitInformation)
+  - AssignProcessToJobObject
+  - ResumeThread
+  - TerminateProcess (reserved for future use; the Job Object
+    handles termination via KILL_ON_JOB_CLOSE)
+
+Other v0.1.7 changes:
+  - versioninfo.json: bumped to 0.1.7.0
+  - resource_windows_amd64.syso: regenerated
+
+Verified:
+  - Cross-compiled windows/amd64 binary: 3,567,616 bytes
+  - Contains VS_VERSION_INFO with "0.1.7.0" (UTF-16LE)
+  - All 4 platform binaries built clean
+  - The CREATE_SUSPENDED + Job Object pattern matches the Microsoft
+    recommended approach for process tree lifecycle management.
