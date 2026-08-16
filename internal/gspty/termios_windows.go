@@ -1,0 +1,190 @@
+// Windows terminal raw-mode and window-size helpers for gspty.
+//
+// On Windows there is no termios API. Raw mode is approximated by:
+//   - GetConsoleMode(stdin) → save current flags
+//   - SetConsoleMode(stdin, ENABLE_VIRTUAL_TERMINAL_INPUT)
+//     This is the closest Windows equivalent of stty_set_raw(): VT
+//     input mode disables line editing, echo, and signal generation
+//     (Ctrl-C is delivered as a key event rather than raising
+//     SIGINT), letting keystrokes flow through verbatim.
+//   - On restore, SetConsoleMode(stdin, saved_flags).
+//
+// Window size is queried via GetConsoleScreenBufferInfo. The relevant
+// dimension is srWindow (the visible viewport) — Win32 distinguishes
+// between the screen buffer (which can be larger than the window)
+// and the window, but the C original uses the visible terminal size.
+
+//go:build windows
+
+package gspty
+
+import (
+        "fmt"
+        "os"
+        "syscall"
+        "unsafe"
+)
+
+// SavedTermios holds the original console mode so it can be restored.
+type SavedTermios struct {
+        fd    syscall.Handle
+        mode  uint32
+        saved bool
+}
+
+// SaveStdin captures the current console mode of stdin for later
+// restoration. If stdin is not a console, returns a SavedTermios with
+// saved=false so RestoreStdin is a no-op.
+func SaveStdin() (*SavedTermios, error) {
+        fd := syscall.Handle(os.Stdin.Fd())
+        var mode uint32
+        r, _, _ := procGetConsoleMode.Call(uintptr(fd), uintptr(unsafe.Pointer(&mode)))
+        if r == 0 {
+                // Not a console (e.g. pipe). Treat as no-op.
+                return &SavedTermios{fd: fd, saved: false}, nil
+        }
+        return &SavedTermios{fd: fd, mode: mode, saved: true}, nil
+}
+
+// RestoreStdin restores the console mode captured by SaveStdin.
+// No-op if the original was not a console.
+func (s *SavedTermios) RestoreStdin() error {
+        if s == nil || !s.saved {
+                return nil
+        }
+        r, _, err := procSetConsoleMode.Call(uintptr(s.fd), uintptr(s.mode))
+        if r == 0 {
+                return fmt.Errorf("gspty: SetConsoleMode restore: %w", err)
+        }
+        return nil
+}
+
+// SetRawStdin puts stdin into raw mode (the Windows equivalent) and
+// enables Virtual Terminal Processing on stdout so that ANSI escape
+// sequences emitted by the remote shell (cursor positioning, color,
+// clear-screen, etc. — which ConPTY produces in abundance after every
+// ResizePseudoConsole) are interpreted by the local console host
+// instead of being printed verbatim as raw text with extra newlines.
+//
+// Without ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout, the remote
+// cmd.exe's redraw sequences (e.g. "\x1b[2J\x1b[H" sent after every
+// resize) appear to the user as a flood of empty lines — Bug 3 in
+// v0.1.9. On Windows 10+ this flag is the default for console hosts
+// but is NOT set when stdin has been switched to VT-input mode (the
+// console host treats the combination as "headless raw mode" and
+// disables VT output as well). We re-enable it explicitly here.
+//
+// Returns the previous state for restoration on exit.
+func SetRawStdin() (*SavedTermios, error) {
+        fd := syscall.Handle(os.Stdin.Fd())
+        var mode uint32
+        r, _, err := procGetConsoleMode.Call(uintptr(fd), uintptr(unsafe.Pointer(&mode)))
+        if r == 0 {
+                // Not a console (e.g. pipe). No-op.
+                return &SavedTermios{fd: fd, saved: false}, nil
+        }
+        saved := &SavedTermios{fd: fd, mode: mode, saved: true}
+        // Raw mode on Windows = VT input only. This is closer to "no
+        // line editing, no echo" than disabling ENABLE_PROCESSED_INPUT
+        // (the latter would also drop Ctrl-C handling, which is what
+        // we want for interactive shells).
+        r, _, err = procSetConsoleMode.Call(uintptr(fd), uintptr(ENABLE_VIRTUAL_TERMINAL_INPUT))
+        if r == 0 {
+                return nil, fmt.Errorf("gspty: SetConsoleMode raw: %w", err)
+        }
+        // Bug 3 fix: ensure stdout has VT processing enabled so that
+        // ANSI sequences from the remote shell are interpreted as
+        // control sequences (cursor positioning, clear screen, color)
+        // rather than printed as raw text — which previously caused
+        // "excessive empty lines" on the client after the cmd.exe
+        // prompt. We save stdout's mode so we can restore it on exit.
+        enableStdoutVTProcessing()
+        return saved, nil
+}
+
+// enableStdoutVTProcessing sets ENABLE_VIRTUAL_TERMINAL_PROCESSING
+// (and the standard ENABLE_PROCESSED_OUTPUT + ENABLE_WRAP_AT_EOL_OUTPUT
+// flags) on stdout. This is a best-effort, fire-and-forget call: if
+// stdout isn't a console (e.g. piped to a file) or the SetConsoleMode
+// call fails, we silently move on — the caller's data path is still
+// correct, only the local interpretation of ANSI sequences is affected.
+//
+// The original stdout mode is NOT restored on exit because:
+//   1. The process is exiting anyway and the console will reset.
+//   2. If we restore, the LAST redraw sequences from the remote shell
+//      (printed during our shutdown) would appear as garbage again.
+func enableStdoutVTProcessing() {
+        out := syscall.Handle(os.Stdout.Fd())
+        var outMode uint32
+        r, _, _ := procGetConsoleMode.Call(uintptr(out), uintptr(unsafe.Pointer(&outMode)))
+        if r == 0 {
+                // stdout isn't a console. Nothing to do.
+                return
+        }
+        // OR in VT processing; keep the existing flags (wrap-at-eol,
+        // processed-output) so we don't accidentally disable something
+        // the user's terminal was relying on.
+        newMode := outMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT
+        // SetConsoleMode returns 0 on failure; we don't propagate the
+        // error because VT output is a nice-to-have, not a correctness
+        // requirement.
+        _, _, _ = procSetConsoleMode.Call(uintptr(out), uintptr(newMode))
+}
+
+// GetStdinWindowSize returns the terminal's current visible size.
+// Returns (80, 24) on any error (matching the C original's fallback).
+//
+// BUG FIX (v0.1.15): the previous version passed os.Stdin.Fd() to
+// GetConsoleScreenBufferInfo. That API requires a console OUTPUT
+// handle (hConsoleOutput), NOT an input handle. Passing stdin always
+// fails with ERROR_INVALID_HANDLE (the call returns 0), so the code
+// fell through to the `return 80, 24` fallback — EVERY Windows client
+// reported 80x24 regardless of the actual window size.
+//
+// Net effect: the server created a ConPTY at 80x24, the remote shell
+// formatted output for 80 columns, but the client's real terminal was
+// e.g. 120 columns wide. VT cursor-positioning sequences (CUP, ED)
+// emitted by the shell assumed 80-col layout and positioned the cursor
+// at wrong columns on the wider client terminal — producing the
+// "overwritten text" / "lines scramble" symptom the user reported.
+//
+// The function name "GetStdinWindowSize" is kept for source
+// compatibility with the Unix build (where ioctl(TIOCGWINSZ) is done
+// on stdin because stdin/stdout share the same tty device). On Windows
+// the console input handle and screen buffer handle are distinct, so
+// we query the screen buffer via stdout.
+//
+// Additional fix: if stdout is NOT a console (e.g. piped to a file),
+// we fall back to trying stderr (which might still be a console), and
+// only then to the 80x24 default. This covers the case where the user
+// redirects stdout but still wants a sensible default.
+func GetStdinWindowSize() (cols, rows uint16) {
+        // Try stdout first — it's the most common console output handle.
+        if c, r, ok := queryConsoleSize(os.Stdout.Fd()); ok {
+                return c, r
+        }
+        // stdout isn't a console (maybe piped). Try stderr — if the user
+        // only redirected stdout, stderr might still be a console.
+        if c, r, ok := queryConsoleSize(os.Stderr.Fd()); ok {
+                return c, r
+        }
+        // Neither is a console. Use the default.
+        return 80, 24
+}
+
+// queryConsoleSize calls GetConsoleScreenBufferInfo on the given handle
+// and returns (cols, rows, true) on success, or (0, 0, false) if the
+// handle is not a console screen buffer.
+func queryConsoleSize(fd uintptr) (cols, rows uint16, ok bool) {
+        var info consoleScreenBufferInfo
+        r, _, _ := procGetConsoleScreenBufferInfo.Call(fd, uintptr(unsafe.Pointer(&info)))
+        if r == 0 {
+                return 0, 0, false
+        }
+        cols = uint16(info.Window.Right - info.Window.Left + 1)
+        rows = uint16(info.Window.Bottom - info.Window.Top + 1)
+        if cols == 0 || rows == 0 {
+                return 0, 0, false
+        }
+        return cols, rows, true
+}
