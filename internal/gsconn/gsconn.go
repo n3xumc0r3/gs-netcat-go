@@ -343,9 +343,18 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
         }
 
         // Dial the relay with the listen/connect packet.
+        if os.Getenv("GSPORT_DEBUG") != "" {
+                fmt.Fprintf(os.Stderr, "[gsport] gsconn.Dial: dialing relay %s:%d (mode=%v, flags=0x%02x, useInBand=%v, noEnc=%v)\n",
+                        opts.RelayHost, opts.RelayPort, mode, gopts.Flags, opts.UseInBand, opts.NoEncryption)
+        }
+        tDial := time.Now()
         relay, err := gsrn.Dial(creds.Address, mode == ModeListen, gopts)
         if err != nil {
                 return nil, err
+        }
+        if os.Getenv("GSPORT_DEBUG") != "" {
+                fmt.Fprintf(os.Stderr, "[gsport] gsconn.Dial: relay TCP connected (took %v), %s packet sent\n",
+                        time.Since(tDial), map[bool]string{true: "_gs_listen", false: "_gs_connect"}[mode == ModeListen])
         }
 
         // Enable TCP keepalive on the relay socket so consumer NATs don't
@@ -362,7 +371,32 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
         }
 
         // Set handshake deadline on the underlying TCP.
-        _ = relay.SetDeadline(time.Now().Add(opts.HandshakeTimeout))
+        //
+        // BUG FIX (v0.1.17): In LISTEN mode the relay will hold the
+        // connection open until a CONNECT peer arrives — which could
+        // take minutes, hours, or days. The previous code applied
+        // opts.HandshakeTimeout (default 30s) to relay.Start(), which
+        // fired before any connector had a chance to connect. Symptom:
+        //
+        //     gsrn: read start/status: read tcp 192.168.x.x:ppppp->152.53.173.29:443: i/o timeout
+        //
+        // after ~30s in `-l -i` mode, even when the relay was perfectly
+        // reachable. The user could never get a server up.
+        //
+        // Fix: in CONNECT mode the relay must respond with _gs_start (or
+        // _gs_status) within seconds, so the deadline covering Start()
+        // + SendAccept() + TLS handshake is correct. In LISTEN mode we
+        // do NOT set a deadline before Start() — Start() may legitimately
+        // block indefinitely. The deadline is deferred to just before
+        // the TLS handshake (set below, after Start() returns), so a
+        // hung TLS peer still gets bounded.
+        if mode == ModeConnect {
+                _ = relay.SetDeadline(time.Now().Add(opts.HandshakeTimeout))
+        }
+        if os.Getenv("GSPORT_DEBUG") != "" {
+                fmt.Fprintf(os.Stderr, "[gsport] relay dialed (mode=%v, addr=%x); waiting for _gs_start (deadline=%v)\n",
+                        mode, creds.Address[:4], mode == ModeConnect)
+        }
 
         // Pipeline optimization: build the TLS config in parallel with
         // waiting for _gs_start. buildTLSConfig itself is O(1) but the
@@ -401,6 +435,20 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
                 fmt.Fprintf(os.Stderr, "[gsport] role assigned: %v (after %v)\n", role, time.Since(tStart))
         }
 
+        // In LISTEN mode we deferred the deadline until now (see above).
+        // _gs_start has arrived — a connector is waiting on the other
+        // end. From here on the TLS handshake should complete in
+        // seconds; if it hangs, the deadline still bounds it. This
+        // preserves the original safety property (a stuck TLS peer
+        // can't hold us forever) without breaking the legitimate
+        // long wait for a connector in LISTEN mode.
+        if mode == ModeListen {
+                _ = relay.SetDeadline(time.Now().Add(opts.HandshakeTimeout))
+                if os.Getenv("GSPORT_DEBUG") != "" {
+                        fmt.Fprintf(os.Stderr, "[gsport] deadline set for TLS handshake: %v\n", opts.HandshakeTimeout)
+                }
+        }
+
         // Acknowledge the role assignment.
         tAccept := time.Now()
         if err := relay.SendAccept(); err != nil {
@@ -414,6 +462,10 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
         // Clear the deadline — application data flows under no deadline
         // (caller may set its own via SetDeadline).
         _ = relay.SetDeadline(time.Time{})
+        if os.Getenv("GSPORT_DEBUG") != "" {
+                fmt.Fprintf(os.Stderr, "[gsport] deadline cleared, ready for %s\n",
+                        map[bool]string{true: "raw data flow (-C)", false: "TLS handshake"}[opts.NoEncryption])
+        }
 
         // -C (NoEncryption): skip TLS-SRP entirely. The relay TCP is the
         // data channel. rawConn is the relay net.Conn directly, so all

@@ -29,6 +29,7 @@ import (
         "fmt"
         "io"
         "net"
+        "os"
         "time"
 )
 
@@ -482,9 +483,31 @@ func Dial(addr [16]byte, listen bool, opts *Options) (*Conn, error) {
 //
 // We do NOT consume the subsequent _gs_accept we send back; the caller
 // is expected to call SendAccept() after Start() returns.
+//
+// Error diagnostic aid: when GSPORT_DEBUG is set, the wrapped error is
+// also printed with a hint distinguishing the two common failure modes:
+//   - EOF                → relay closed the TCP connection (often means
+//                          duplicate LISTEN registration or relay-side
+//                          idle eviction; the relay sent no _gs_status)
+//   - i/o timeout        → caller's deadline fired while still waiting
+//                          for _gs_start. In LISTEN mode this is normal
+//                          if no connector ever arrives; in CONNECT
+//                          mode it usually means the relay is overloaded
+//                          or the network is dropping packets.
 func (c *Conn) Start() (Role, error) {
         var p Control
         if _, err := io.ReadFull(c.Conn, p[:]); err != nil {
+                if os.Getenv("GSPORT_DEBUG") != "" {
+                        hint := "see GSPORT_DEBUG hint in source"
+                        switch {
+                        case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+                                hint = "relay closed TCP without sending _gs_status (often: duplicate LISTEN, BAD_AUTH, or relay-side idle eviction)"
+                        case isTimeout(err):
+                                hint = "deadline fired while waiting for _gs_start (in LISTEN mode this means no connector ever arrived; in CONNECT mode the relay is slow/unreachable)"
+                        }
+                        fmt.Fprintf(os.Stderr, "[gsport] gsrn.Start: read failed: %v\n", err)
+                        fmt.Fprintf(os.Stderr, "[gsport] gsrn.Start: hint: %s\n", hint)
+                }
                 return RoleUnassigned, fmt.Errorf("gsrn: read start/status: %w", err)
         }
 
@@ -619,3 +642,15 @@ func (e StatusError) IsFatal() bool { return e.ErrType == StatusFatal }
 // silence unused-import warnings for binary (we use it for future
 // extensibility — currently no multi-byte fields).
 var _ = binary.BigEndian
+
+// isTimeout reports whether err is a network timeout error (either a
+// *net.OpError with Timeout() == true, or a wrapped variant thereof).
+// Used by Start()'s diagnostic hint to distinguish "relay closed" from
+// "we timed out waiting for the relay".
+func isTimeout(err error) bool {
+        var ne net.Error
+        if errors.As(err, &ne) {
+                return ne.Timeout()
+        }
+        return false
+}

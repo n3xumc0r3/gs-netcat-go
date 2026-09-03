@@ -70,27 +70,66 @@ import (
 )
 
 // expandVerboseFlags collapses `-vv` and `-vvv` (and the long-form `--vv`/
-// `--vvv`) into a single `-v`. The Go port treats any verbose level as
-// "maximum": we don't differentiate between -v / -vv / -vvv. This keeps
-// the CLI drop-in compatible with the C original (which accepts all
-// three forms) without dragging in a countFlag type.
-func expandVerboseFlags(args []string) []string {
+// `--vvv`) into a single `-v` PLUS records the verbosity level so the
+// rest of the program can differentiate -v / -vv / -vvv.
+//
+// The Go port treats -v and -vv as "normal verbose" (one-bool flag) and
+// -vvv as "insanely verbose" (sets GSPORT_DEBUG=1 in the process
+// environment so all [gsport] debug logs light up). This keeps the CLI
+// drop-in compatible with the C original (which accepts all three forms)
+// without dragging in a countFlag type.
+//
+// Returns (newArgs, verboseLevel) where verboseLevel is 1, 2, or 3.
+func expandVerboseFlags(args []string) ([]string, int) {
         out := make([]string, 0, len(args))
+        level := 0
+        bump := func(n int) {
+                if n > level {
+                        level = n
+                }
+        }
         for _, a := range args {
                 switch a {
-                case "-vv", "-vvv":
+                case "-v":
                         out = append(out, "-v")
-                case "--vv", "--vvv":
+                        bump(1)
+                case "-vv":
+                        out = append(out, "-v")
+                        bump(2)
+                case "-vvv":
+                        out = append(out, "-v")
+                        bump(3)
+                case "--v":
                         out = append(out, "--v")
+                        bump(1)
+                case "--vv":
+                        out = append(out, "--v")
+                        bump(2)
+                case "--vvv":
+                        out = append(out, "--v")
+                        bump(3)
                 default:
                         out = append(out, a)
                 }
         }
-        return out
+        if level == 0 {
+                level = 1 // -v default if no flag was seen but caller expects ≥1
+        }
+        return out, level
 }
 
 func main() {
-        if err := run(expandVerboseFlags(os.Args[1:])); err != nil {
+        args, verboseLevel := expandVerboseFlags(os.Args[1:])
+        // -vvv (level 3) automatically enables the [gsport] debug trace
+        // that's normally gated by GSPORT_DEBUG. This surfaces the
+        // internal relay-handshake / TLS-handshake / event-pump logs
+        // without requiring the user to know about an undocumented env
+        // var. Lower verbose levels (-v, -vv) keep the original
+        // user-facing verbose output only.
+        if verboseLevel >= 3 && os.Getenv("GSPORT_DEBUG") == "" {
+                os.Setenv("GSPORT_DEBUG", "1")
+        }
+        if err := run(args); err != nil {
                 fmt.Fprintln(os.Stderr, "gs-netcat:", err)
                 os.Exit(1)
         }
@@ -180,7 +219,7 @@ Example for an interactive session:
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.16-fix"
+        const defaultVersion = "v0.1.17-fix"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -478,6 +517,14 @@ Example for an interactive session:
                 return runPortForwardServer(secret, relayHost, relayPort, flagDstIP, flagPort, opts, verbose)
         }
 
+        // In LISTEN mode the next call blocks until a CONNECT peer
+        // arrives — which can take arbitrarily long. Tell the user so
+        // they don't think the program is hung. (v0.1.17: previously
+        // this also crashed after 30s with i/o timeout because of a
+        // too-short handshake deadline; that's now fixed.)
+        if listen && verbose {
+                fmt.Fprintf(os.Stderr, "[gs-netcat] listening for incoming GS connections (will block until a peer connects)...\n")
+        }
         conn, err := gsconn.Dial(secret, mode, opts)
         if err != nil {
                 return err
