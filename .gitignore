@@ -40,3 +40,5 @@ go.work.sum
 # OS junk
 Thumbs.db
 desktop.ini
+.local/
+/tmp/

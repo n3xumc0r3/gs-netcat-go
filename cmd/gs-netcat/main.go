@@ -219,7 +219,7 @@ Example for an interactive session:
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.17-fix"
+        const defaultVersion = "v0.1.18-fix"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -525,7 +525,23 @@ Example for an interactive session:
         if listen && verbose {
                 fmt.Fprintf(os.Stderr, "[gs-netcat] listening for incoming GS connections (will block until a peer connects)...\n")
         }
-        conn, err := gsconn.Dial(secret, mode, opts)
+        // v0.1.18: DPI/TSPU port-443 fallback.
+        //
+        // In some networks (notably Russia's TSPU/DPI infrastructure)
+        // port 443 is inspected for a TLS ClientHello and any non-TLS
+        // payload — including the GSRN _gs_listen/_gs_connect binary
+        // packet — triggers an immediate RST/EOF. The gsocket.org
+        // relay also accepts connections on ports 7350 and 53, which
+        // are not DPI-inspected as aggressively (they're not HTTPS).
+        //
+        // When the user did NOT pass --relay explicitly (i.e. we're
+        // using the default derived relay host + port 443) AND the
+        // first Dial returns an instant EOF (relay closed TCP without
+        // sending _gs_status), we automatically retry on ports 7350
+        // and 53 before giving up. If the user DID pass --relay they
+        // chose their port intentionally and we don't override it.
+        userPickedRelay := relay != ""
+        conn, err := dialWithPortFallback(secret, mode, opts, relayHost, relayPort, userPickedRelay, verbose)
         if err != nil {
                 return err
         }
@@ -917,6 +933,106 @@ func modeStr(listen bool) string {
                 return "LISTEN"
         }
         return "CONNECT"
+}
+
+// altRelayPorts lists alternative ports the gsocket.org production relay
+// accepts connections on, in fallback order. Port 443 is the default and
+// is NOT in this list (it's tried first by dialWithPortFallback).
+//
+// - 7350: gsocket's official alternate port (mentioned on gsocket.io/deploy).
+// -   53: DNS port — rarely DPI-inspected because it carries DNS traffic.
+//
+// Port 7351 (GSRN_DEFAULT_PORT_CON in gsocket.h) is the C original's
+// fallback but we observed it timing out in production (Aug 2026), so we
+// skip it. Port 22 (SSH) also works in testing but we omit it because
+// some ISPs rate-limit or block outbound 22 to non-ISP hosts.
+var altRelayPorts = []int{7350, 53}
+
+// instantEOF reports whether err looks like "relay closed TCP immediately
+// after we sent _gs_listen/_gs_connect, without sending any _gs_status".
+// This signature is the classic DPI/TSPU port-443 block: the inspector
+// sees our binary packet (which is not a TLS ClientHello), decides port
+// 443 is being abused, and injects a RST.
+//
+// We treat as instant-EOF:
+//   - any error containing "EOF" (covers io.EOF and io.ErrUnexpectedEOF
+//     wrapped by gsrn.Start's "gsrn: read start/status: %w" format)
+//   - "connection reset by peer" — same root cause, different OS wording
+//
+// We do NOT treat "i/o timeout" as instant-EOF (that's the old v0.1.16
+// symptom of the 30s handshake deadline firing, now fixed in v0.1.17).
+func instantEOF(err error) bool {
+        if err == nil {
+                return false
+        }
+        msg := err.Error()
+        return strings.Contains(msg, "EOF") || strings.Contains(msg, "connection reset by peer")
+}
+
+// dialWithPortFallback tries the requested relay host:port first. If
+// the user did NOT explicitly pass --relay (i.e. they're using the
+// default derived host + port 443) AND the first attempt fails with
+// an instant EOF (signature of DPI/TSPU port-443 blocking), it retries
+// on each port in altRelayPorts.
+//
+// If userPickedRelay is true (user passed --relay), no fallback happens
+// — the user chose their endpoint intentionally.
+//
+// On success returns the connection; the caller can inspect opts.RelayPort
+// to see which port actually worked (we mutate opts in place before each
+// attempt).
+func dialWithPortFallback(secret string, mode gsconn.Mode, opts *gsconn.Options, host string, port int, userPickedRelay, verbose bool) (*gsconn.Conn, error) {
+        // First attempt: the user's chosen port (or default 443).
+        opts.RelayHost = host
+        opts.RelayPort = port
+        conn, err := gsconn.Dial(secret, mode, opts)
+        if err == nil {
+                return conn, nil
+        }
+        // If the user explicitly chose this relay, or the failure is NOT
+        // an instant EOF, return the error as-is. We only fall back on
+        // the DPI signature.
+        if userPickedRelay {
+                return nil, err
+        }
+        if !instantEOF(err) {
+                return nil, err
+        }
+        // DPI signature detected. Try alternate ports.
+        if verbose {
+                fmt.Fprintf(os.Stderr, "[gs-netcat] relay on port %d returned instant EOF (likely DPI/TSPU blocking non-TLS traffic on 443). Trying alternate ports...\n", port)
+        }
+        for _, altPort := range altRelayPorts {
+                if altPort == port {
+                        continue
+                }
+                if verbose {
+                        fmt.Fprintf(os.Stderr, "[gs-netcat] retrying on port %d...\n", altPort)
+                }
+                opts.RelayHost = host
+                opts.RelayPort = altPort
+                conn, err2 := gsconn.Dial(secret, mode, opts)
+                if err2 == nil {
+                        if verbose {
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] connected on port %d. TIP: pass --relay %s:%d to skip the 443 probe next time.\n", altPort, host, altPort)
+                        }
+                        return conn, nil
+                }
+                if verbose {
+                        fmt.Fprintf(os.Stderr, "[gs-netcat] port %d: %v\n", altPort, err2)
+                }
+                // If this port ALSO gave instant EOF, keep trying the
+                // next one. If it gave a different error (e.g.
+                // BAD_AUTH, CONNREFUSED), the relay is reachable on
+                // this port — return that error to the user so they
+                // see the real problem instead of us silently moving
+                // on.
+                if !instantEOF(err2) {
+                        return nil, err2
+                }
+        }
+        // All ports blocked. Return the original error (with a hint).
+        return nil, fmt.Errorf("%w\n[note] all relay ports (443, 7350, 53) returned instant EOF — this network is blocking GSRN traffic. Try a different network, VPN, or a self-hosted relay via --relay host:port", err)
 }
 
 // deriveCreds is a thin wrapper around gskdf.Derive used by both main
