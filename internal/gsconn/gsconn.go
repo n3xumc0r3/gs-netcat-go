@@ -391,6 +391,14 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
         if tc, ok := relay.Conn.(*net.TCPConn); ok {
                 _ = tc.SetKeepAlive(true)
                 _ = tc.SetKeepAlivePeriod(30 * time.Second)
+                // v0.1.26: Disable Nagle's algorithm. The Go client sends 1-byte
+                // writes for each keystroke (io.Copy reads 1 byte at a time from
+                // raw stdin on Windows). With Nagle ON, these 1-byte writes are
+                // buffered for up to 200ms waiting for an ACK. This adds latency
+                // to every keystroke. With Nagle OFF (TCP_NODELAY), each keystroke
+                // is sent immediately as its own TLS record.
+                // This is standard practice for interactive SSH/telnet clients.
+                _ = tc.SetNoDelay(true)
         }
 
         // Set handshake deadline on the underlying TCP.
