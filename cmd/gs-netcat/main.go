@@ -219,7 +219,7 @@ Example for an interactive session:
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.19-fix"
+        const defaultVersion = "v0.1.20-fix"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -978,6 +978,24 @@ func instantEOF(err error) bool {
 // If userPickedRelay is true (user passed --relay), no fallback happens
 // — the user chose their endpoint intentionally.
 //
+// v0.1.20: Before falling back to alt ports, retry the original port
+// up to 2 more times with a 1.5s sleep between attempts. The instant-EOF
+// signature is ambiguous: it can mean DPI/TSPU blocking (real reason to
+// fall back), but it can ALSO mean "relay slot still occupied by a
+// listener that's in the process of cleaning up after a recent
+// disconnect" (race window of 1-5 seconds on production relays).
+//
+// Falling back to port 7350/53 in the race case is wrong: those ports
+// are NOT relay endpoints for the derived host (only :443 is), so they
+// ALSO return EOF — and we waste 3 × ~50ms × N attempts before giving
+// up. The user sees "all ports blocked" and assumes DPI, when in
+// reality they just needed to wait 3 seconds for the relay to release
+// the slot.
+//
+// Retry policy: 3 attempts on the original port, 1.5s apart. Only if
+// ALL attempts give instant EOF do we conclude "real block" and try
+// alt ports.
+//
 // On success returns the connection; the caller can inspect opts.RelayPort
 // to see which port actually worked (we mutate opts in place before each
 // attempt).
@@ -990,17 +1008,54 @@ func dialWithPortFallback(secret string, mode gsconn.Mode, opts *gsconn.Options,
                 return conn, nil
         }
         // If the user explicitly chose this relay, or the failure is NOT
-        // an instant EOF, return the error as-is. We only fall back on
-        // the DPI signature.
+        // an instant EOF, return the error as-is. We only retry/fall back
+        // on the DPI signature.
         if userPickedRelay {
                 return nil, err
         }
         if !instantEOF(err) {
                 return nil, err
         }
-        // DPI signature detected. Try alternate ports.
+
+        // v0.1.20: Retry the same port a few times before concluding DPI.
+        // The C-side watchdog (gsocket.io/y deploy uses -D) takes 1-5
+        // seconds to release the listener slot after an abrupt disconnect,
+        // and during that window the relay returns instant EOF on every
+        // _gs_connect. Falling back to 7350/53 in this window is wrong
+        // (those ports aren't relay endpoints for the derived host) and
+        // confuses the user into thinking DPI is blocking them.
+        const maxRetries = 2              // 1 initial + 2 retries = 3 attempts total
+        const retryDelay = 1500 * time.Millisecond
+        lastErr := err
+        for attempt := 1; attempt <= maxRetries; attempt++ {
+                if verbose {
+                        fmt.Fprintf(os.Stderr, "[gs-netcat] relay on port %d returned instant EOF (attempt %d/%d). Waiting %v before retry (relay slot may still be occupied by a previous session)...\n",
+                                port, attempt, maxRetries+1, retryDelay)
+                }
+                time.Sleep(retryDelay)
+                opts.RelayHost = host
+                opts.RelayPort = port
+                conn, err2 := gsconn.Dial(secret, mode, opts)
+                if err2 == nil {
+                        if verbose {
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] connected on port %d after %d retries.\n", port, attempt)
+                        }
+                        return conn, nil
+                }
+                lastErr = err2
+                if !instantEOF(err2) {
+                        // Non-EOF error means the relay is reachable but
+                        // rejecting us (BAD_AUTH, CONNREFUSED, etc.) —
+                        // surface the real error, don't retry or fall back.
+                        return nil, err2
+                }
+        }
+
+        // All retries on the original port gave instant EOF. Now it's
+        // genuinely likely DPI/TSPU blocking — try alternate ports.
         if verbose {
-                fmt.Fprintf(os.Stderr, "[gs-netcat] relay on port %d returned instant EOF (likely DPI/TSPU blocking non-TLS traffic on 443). Trying alternate ports...\n", port)
+                fmt.Fprintf(os.Stderr, "[gs-netcat] relay on port %d returned instant EOF after %d attempts (likely DPI/TSPU blocking non-TLS traffic on 443). Trying alternate ports...\n",
+                        port, maxRetries+1)
         }
         for _, altPort := range altRelayPorts {
                 if altPort == port {
@@ -1032,7 +1087,8 @@ func dialWithPortFallback(secret string, mode gsconn.Mode, opts *gsconn.Options,
                 }
         }
         // All ports blocked. Return the original error (with a hint).
-        return nil, fmt.Errorf("%w\n[note] all relay ports (443, 7350, 53) returned instant EOF — this network is blocking GSRN traffic. Try a different network, VPN, or a self-hosted relay via --relay host:port", err)
+        return nil, fmt.Errorf("%w\n[note] all relay ports (443, 7350, 53) returned instant EOF after %d retries on 443 — this network is blocking GSRN traffic, or the previous session's relay slot is still occupied. Wait 10s and try again, or try a different network, VPN, or a self-hosted relay via --relay host:port",
+                lastErr, maxRetries+1)
 }
 
 // deriveCreds is a thin wrapper around gskdf.Derive used by both main
@@ -1124,6 +1180,11 @@ func handleMessage(conn *gsconn.Conn, ctx *eventCtx, ev gspkt.Event, verbose boo
                         }
                 } else {
                         // We are the connector: this is a PONG (reply to our PING).
+                        // v0.1.20: update lastPongAt so inBandPinger's dead-server
+                        // check knows the server is still alive. Without this, the
+                        // check would fire after 2 intervals even on a healthy
+                        // connection.
+                        conn.MarkPongReceived()
                         if verbose {
                                 if len(ev.Data) >= 5 {
                                         load := uint16(ev.Data[0])<<8 | uint16(ev.Data[1])

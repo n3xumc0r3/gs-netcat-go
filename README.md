@@ -147,6 +147,40 @@ the same production relay. Verified against C `gs-netcat` v1.4.40:
 - IDS subscription (`--ids` ↔ Ctrl-e + c in C console UI)
 - `-t` test mode against a C listener — same OK/NO/NET-ERROR output
 
+### Connecting to a C server deployed via `gsocket.io/y`
+
+The THC deploy script (`bash -c "$(curl -fsSL https://gsocket.io/y)"`)
+launches the C `gs-netcat` listener with the default flags
+`-l -i -q -D` (listen + **in-band** + quiet + daemonize). This means
+the C server is in **in-band** mode.
+
+**You MUST pass `-i` on the Go client side to match.** Without `-i`:
+
+| Symptom | Cause |
+|---------|-------|
+| Strange characters appearing at the prompt during idle (every ~45 s) | The C server sends in-band PING packets (`0xFB 0x10 ...`); a raw-mode Go client doesn't decode them and writes the bytes to stdout as garbage |
+| Connection freezes after a few commands | The C server runs `GS_PKT_decode` on your raw input stream; random bytes that look like in-band escape sequences trigger a protocol error → server closes the connection |
+| "Connection closed" within seconds of connecting | Same as above — any byte in your input that the C server's decoder rejects will tear down the session |
+
+**Correct usage:**
+
+```powershell
+# Windows / Linux / macOS — always add -i when the server was deployed
+# via gsocket.io/y (or any other method that uses -i on the server side)
+./gs-netcat -i -s <secret>
+```
+
+If you control both sides and want raw byte pipe (no in-band multiplexing),
+omit `-i` on BOTH ends:
+
+```bash
+# Server (Go port): raw byte pipe, no in-band
+./gs-netcat -l -s MySecret
+
+# Client (Go port): raw byte pipe, no in-band
+./gs-netcat -s MySecret
+```
+
 ## Acknowledgements
 
 - The original [`gsocket`](https://github.com/hackerschoice/gsocket) project

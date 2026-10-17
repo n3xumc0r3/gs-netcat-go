@@ -95,3 +95,53 @@ Stage Summary:
 - All existing unit tests still pass; no test regressions.
 - Race detector clean.
 - go vet reports the same pre-existing tlssrp lock-copy warning (unchanged).
+
+---
+Task ID: v0.1.20-fix
+Agent: external-audit
+Task: Fix user-reported symptoms: "символы при простое", "disconnect после нескольких команд", race-condition на relay-slot освобождении.
+
+Work Log:
+- User reported: после v0.1.19-fix подключение вообще не проходит (3 порта EOF). Анализ показал race condition: C-side watchdog (gsocket.io/y uses -D) держит listener slot 1-5s после disconnect, и v0.1.18 instant-EOF детектор уходил в fallback на несуществующие 7350/53 вместо retry на 443.
+- User reported: странные символы в простое (2 байта в терминале). Анализ C-source показал что gsocket.io/y деплоит C-сервер с флагами -liqD (in-band). Без -i на клиенте PING пакеты (0xFB 0x10 ...) печатаются как мусор.
+- User reported: зависание после нескольких команд. Без -i на клиенте C-сервер в cb_read_gs вызывает GS_PKT_decode на raw поток; любой 0xFB-подобный байт в вводе триггерит protocol error → FATAL → peer_free → disconnect.
+- Реальный Ctrl-e (0x05) детект в C только на client-side (read_esc в cb_read_fd), НЕ на server-side — моя предыдущая гипотеза была неверна, это явно задокументировано.
+
+Patches applied:
+
+1. dialWithPortFallback: retry на 443 перед fallback (cmd/gs-netcat/main.go)
+   - До: первый EOF на 443 → сразу fallback на 7350/53 → тоже EOF → "all ports blocked"
+   - После: первый EOF → 2 retry на 443 с задержкой 1.5s → если все ещё EOF, тогда fallback
+   - Покрывает race condition с освобождением listener slot (1-5s окно)
+   - Не влияет на реальный DPI/TSPU блок (там тоже 3 attempt всё равно получат EOF, но теперь fallback корректно сработает после 3s вместо мгновенного)
+
+2. PONG-tracking dead-server detection (internal/gsconn/gsconn.go + cmd/gs-netcat/main.go)
+   - Добавил lastPongAt atomic.Int64 в Conn, инициализируется в Dial
+   - Добавил метод MarkPongReceived() — вызывается из eventPump при MsgPONG
+   - В inBandPinger: если time.Since(lastPongAt) > 2*interval → c.Close()
+   - Покрывает случай когда сервер перестал отвечать (process killed, NAT потерял state, DPI silent drop) — теперь disconnect через 2 interval (90s) вместо 5+ минут TCP-retransmit-timeout
+
+3. WSIZE hysteresis + debounce на Windows (cmd/gs-netcat/sigwinch_windows.go)
+   - До: poll 250ms → любое изменение на 1 пиксель → WSIZE на сервер → TIOCSWINSZ → SIGWINCH → readline redraw → потенциальный deadlock
+   - После: hysteresis 2 пикселя (игнорируем мелкие колебания srWindow) + debounce 200ms (coalesce bursts в один event)
+   - Лечит "stray characters" и потенциально зависание readline от WSIZE-spam
+
+4. README: новая секция "Connecting to a C server deployed via gsocket.io/y"
+   - Объясняет что gsocket.io/y деплоит с -liqD → нужен -i на клиенте
+   - Таблица симптомов: символы в простое, зависание, disconnect — всё из-за raw vs in-band рассинхронизации
+   - Примеры корректного usage
+
+Build verification:
+- go build ./...: clean
+- go test -race ./...: all packages pass, race detector clean
+- Cross-compiled Windows .exe: 5188608 bytes
+- Built download/gs-netcat-v0.1.20-fix.exe (Windows amd64)
+
+Stage Summary:
+- 3 functional fixes + README update
+- Все unit-тесты проходят с -race
+- Это ПОСЛЕДНИЙ набор патчей, которые должны реально помочь пользователю:
+  * retry на 443 убирает ложные DPI-fallback при race condition
+  * PONG-tracking убирает долгий hang при dead-server
+  * WSIZE hysteresis убирает stray characters и потенциальные readline deadlocks на Windows
+- README явно говорит про -i — это решает корневую причину "символов при простое" и "disconnect после нескольких команд" (raw vs in-band рассинхронизация)

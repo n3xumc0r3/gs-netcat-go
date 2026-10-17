@@ -43,6 +43,7 @@ import (
         "net"
         "os"
         "sync"
+        "sync/atomic"
         "time"
 
         "github.com/gsport/gs-netcat/internal/gskdf"
@@ -169,6 +170,18 @@ type Conn struct {
         mode     Mode
         stopPing chan struct{}
 
+        // lastPongAt stores UnixNano of the last PONG received from the
+        // peer. Used by inBandPinger to detect dead-server condition
+        // (server stopped responding to PING) without waiting for TCP
+        // retransmit timeout (which can take minutes). 0 means "no PONG
+        // yet" — initialized to time.Now() at Dial success so the very
+        // first PING doesn't immediately trigger the dead-server check.
+        //
+        // Atomic for lock-free read in inBandPinger (hot path) and
+        // lock-free write in eventPump's MsgPONG handler. sync/atomic
+        // on int64 is safe on all supported platforms.
+        lastPongAt atomic.Int64
+
         // in-band multiplexing state (nil when UseInBand is false).
         // pktMu protects ib's decoder/dataBuf/proto fields; the events
         // channel is safe for concurrent receive without the mutex.
@@ -226,6 +239,16 @@ func (c *Conn) Role() gsrn.Role { return c.role }
 
 // Mode returns the local Mode (listen or connect).
 func (c *Conn) Mode() Mode { return c.mode }
+
+// MarkPongReceived updates the last-PONG-received timestamp used by
+// inBandPinger's dead-server detection. The event-pump SHOULD call
+// this whenever a MsgPONG is received from the peer (the client-side
+// handler in cmd/gs-netcat/main.go does this).
+//
+// Safe for concurrent use — lastPongAt is sync/atomic.Int64.
+func (c *Conn) MarkPongReceived() {
+        c.lastPongAt.Store(time.Now().UnixNano())
+}
 
 // SetDeadline sets the read and write deadlines on the underlying
 // connection (TLS or raw TCP). It mirrors net.Conn.SetDeadline. In
@@ -486,6 +509,11 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
                         mode:     mode,
                         stopPing: make(chan struct{}),
                 }
+                // Initialize lastPongAt so the dead-server check in
+                // inBandPinger doesn't fire on the very first PING (which
+                // would happen if lastPongAt was 0 and we'd just sent a
+                // PING that hasn't been answered yet).
+                c.lastPongAt.Store(time.Now().UnixNano())
                 if opts.UseInBand {
                         c.ib = newInBand()
                 }
@@ -545,6 +573,9 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
                 mode:     mode,
                 stopPing: make(chan struct{}),
         }
+        // Initialize lastPongAt so the dead-server check in
+        // inBandPinger doesn't fire on the very first PING.
+        c.lastPongAt.Store(time.Now().UnixNano())
         if opts.UseInBand {
                 c.ib = newInBand()
         }
@@ -691,15 +722,39 @@ func (c *Conn) pingerStub(interval time.Duration) {
 // expected to reply with MsgPONG; we do NOT block waiting for the reply
 // (fire-and-forget). The peer's PONG arrives as an Event via
 // Conn.Events() for the application to display if it wants.
+//
+// v0.1.20: dead-server detection. After sending each PING, check the
+// last PONG timestamp. If it's older than 2× interval, the server has
+// stopped responding (process killed but TCP not yet RST, NAT lost
+// state, DPI silently dropping one direction, etc.). In that case we
+// close the Conn ourselves instead of waiting for TCP retransmit
+// timeout (which can take 5+ minutes on Linux with default sysctl).
+// The user sees a clean disconnect within 2 intervals instead of an
+// indefinite hang.
 func (c *Conn) inBandPinger(interval time.Duration) {
         t := time.NewTicker(interval)
         defer t.Stop()
         payload := make([]byte, 16) // MsgPING = 16 bytes per gspkt.MsgSize
+        const deadServerMultiplier = 2 // close after 2× interval without PONG
         for {
                 select {
                 case <-c.stopPing:
                         return
                 case <-t.C:
+                        // Dead-server check (BEFORE sending PING so the
+                        // very first tick after Dial doesn't immediately
+                        // trip — lastPongAt was initialized to time.Now()
+                        // in Dial).
+                        last := c.lastPongAt.Load()
+                        if last > 0 {
+                                sincePong := time.Since(time.Unix(0, last))
+                                if sincePong > deadServerMultiplier*interval {
+                                        fmt.Fprintf(os.Stderr, "[gs-netcat] no PONG from server in %v (>%vx interval) — server appears dead, closing connection\n",
+                                                sincePong, deadServerMultiplier)
+                                        _ = c.Close()
+                                        return
+                                }
+                        }
                         if err := c.WriteMsg(gspkt.MsgPING, payload); err != nil {
                                 // PING write failed — the underlying TCP/TLS is broken.
                                 // Close the Conn so inBandRead unblocks and the higher-
