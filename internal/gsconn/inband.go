@@ -21,6 +21,10 @@ type inBand struct {
         dataBuf []byte           // decoded data bytes waiting for Read
         events  chan gspkt.Event // decoded in-band events (buffered)
         proto   error            // captured protocol error (sticky)
+        // eventsClosed is set true by Conn.Close under pktMu, just before
+        // closing the events channel. inBandRead (also under pktMu) checks
+        // this flag before sending to avoid a panic on send-to-closed.
+        eventsClosed bool
 }
 
 // newInBand constructs an inBand with a reasonably-sized event buffer.
@@ -78,6 +82,15 @@ func (c *Conn) inBandRead(p []byte) (int, error) {
                         }
                         // Push events to channel. Non-blocking: drop with warning if full.
                         for _, ev := range events {
+                                // Conn.Close may have closed the events channel
+                                // (under pktMu, which we hold). Check the flag
+                                // before sending to avoid a panic on send-to-closed.
+                                if ib.eventsClosed {
+                                        if debug {
+                                                fmt.Fprintf(os.Stderr, "[gsport] in-band: events channel closed, dropping %+v\n", ev)
+                                        }
+                                        continue
+                                }
                                 select {
                                 case ib.events <- ev:
                                 default:

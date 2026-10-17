@@ -643,16 +643,27 @@ func (c *Conn) Close() error {
         // c.ib.events (Read pushes are also from this Conn's owner); we
         // take care to close only once via stopPing's once-semantics.
         if c.ib != nil {
-                // Mark proto as closed to short-circuit further Read calls.
+                // Atomically (under pktMu):
+                //   1. mark proto as EOF so inBandRead short-circuits
+                //   2. set eventsClosed so inBandRead stops trying to send
+                //   3. close the events channel so eventPump's range loop
+                //      exits and the goroutine doesn't leak.
+                //
+                // Safe because:
+                //   - the only writer to c.ib.events is inBandRead, which
+                //     holds pktMu — and we hold it here too, so we're
+                //     serialized with any in-progress send.
+                //   - inBandRead checks `eventsClosed` before sending, so
+                //     no send-to-closed-channel panic is possible.
+                //   - close() is itself a one-shot operation; the once-flag
+                //     protects against double-close from idempotent Close.
                 c.pktMu.Lock()
                 c.ib.proto = io.EOF
+                if !c.ib.eventsClosed {
+                        c.ib.eventsClosed = true
+                        close(c.ib.events)
+                }
                 c.pktMu.Unlock()
-                // Closing the events channel is unsafe if a Read is still
-                // running (it would panic on send-to-closed). The caller
-                // MUST stop reading before Close. To be safe, we do NOT
-                // close the channel; instead the event-pump's range loop
-                // will exit when it sees the conn's reader goroutine has
-                // ended (typical pattern: select on Events() and ctx.Done()).
         }
         return err
 }
@@ -690,9 +701,13 @@ func (c *Conn) inBandPinger(interval time.Duration) {
                         return
                 case <-t.C:
                         if err := c.WriteMsg(gspkt.MsgPING, payload); err != nil {
-                                if os.Getenv("GSPORT_DEBUG") != "" {
-                                        fmt.Fprintf(os.Stderr, "[gsport] in-band ping write failed: %v\n", err)
-                                }
+                                // PING write failed — the underlying TCP/TLS is broken.
+                                // Close the Conn so inBandRead unblocks and the higher-
+                                // level session loop (runInteractive*, multipeer) sees
+                                // the disconnect and reacts (server: re-listen;
+                                // client: exit so user can reconnect).
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] keepalive PING failed: %v — closing connection\n", err)
+                                _ = c.Close()
                                 return
                         }
                         if os.Getenv("GSPORT_DEBUG") != "" {

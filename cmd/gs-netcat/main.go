@@ -219,7 +219,7 @@ Example for an interactive session:
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.18-fix"
+        const defaultVersion = "v0.1.19-fix"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -1113,7 +1113,11 @@ func handleMessage(conn *gsconn.Conn, ctx *eventCtx, ev gspkt.Event, verbose boo
                         // collects them with graceful fallback.
                         pong := gsstats.PongPayload()
                         if err := conn.WriteMsg(gspkt.MsgPONG, pong); err != nil {
-                                fmt.Fprintf(os.Stderr, "gs-netcat: PONG write failed: %v\n", err)
+                                // PONG write failed — the Conn is broken.
+                                // Close it so the rest of the session loop notices
+                                // (otherwise the client keeps sending PINGs into the void).
+                                fmt.Fprintf(os.Stderr, "gs-netcat: PONG write failed: %v — closing connection\n", err)
+                                _ = conn.Close()
                         }
                         if verbose {
                                 fmt.Fprintf(os.Stderr, "[in-band] PING received, PONG sent\n")
