@@ -74,6 +74,33 @@ func (s *SavedTermios) RestoreStdin() error {
 // console host treats the combination as "headless raw mode" and
 // disables VT output as well). We re-enable it explicitly here.
 //
+// v0.1.21: REAL raw mode, not "VT input only".
+//
+// The previous version only set ENABLE_VIRTUAL_TERMINAL_INPUT and left
+// the default input flags (ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT |
+// ENABLE_PROCESSED_INPUT) enabled. That is NOT raw mode — Windows was
+// still line-editing the input, echoing each keystroke, and processing
+// Ctrl-C / Ctrl-S locally. Symptoms the user reported that this caused:
+//
+//   1. "Doubled characters" — every keystroke was echoed by BOTH the
+//      local Windows console AND the remote bash PTY. The first 'l' in
+//      'ls' was from Windows, the second from bash.
+//
+//   2. Readline hangs when prompt reaches bottom of window. Readline
+//      sends cursor-positioning ANSI sequences to scroll / redraw; the
+//      local Windows console's ENABLE_LINE_INPUT was intercepting
+//      Enter as "submit line" instead of forwarding the raw \r to the
+//      remote. Combined with ENABLE_ECHO_INPUT re-displaying partial
+//      input, readline's redraw state machine desynced and blocked
+//      waiting for a cursor-position report from the local console
+//      (which never came because the input was buffered, not sent).
+//
+// The fix mirrors what ConPTY / OpenSSH's Windows port do: clear ALL
+// the line-editing / echo / signal flags, then add ENABLE_VIRTUAL_TERMINAL_INPUT
+// for VT input passthrough. ENABLE_EXTENDED_FLAGS is kept so that
+// ENABLE_QUICK_EDIT_MODE (if the user had it on) doesn't get clobbered
+// back on by the API.
+//
 // Returns the previous state for restoration on exit.
 func SetRawStdin() (*SavedTermios, error) {
         fd := syscall.Handle(os.Stdin.Fd())
@@ -84,11 +111,23 @@ func SetRawStdin() (*SavedTermios, error) {
                 return &SavedTermios{fd: fd, saved: false}, nil
         }
         saved := &SavedTermios{fd: fd, mode: mode, saved: true}
-        // Raw mode on Windows = VT input only. This is closer to "no
-        // line editing, no echo" than disabling ENABLE_PROCESSED_INPUT
-        // (the latter would also drop Ctrl-C handling, which is what
-        // we want for interactive shells).
-        r, _, err = procSetConsoleMode.Call(uintptr(fd), uintptr(ENABLE_VIRTUAL_TERMINAL_INPUT))
+
+        // Build raw-mode flag set:
+        //   START from current mode (preserves ENABLE_EXTENDED_FLAGS bit
+        //   so QuickEdit doesn't get auto-re-enabled by the API).
+        //   CLEAR the line-editing / echo / signal flags.
+        //   ADD ENABLE_VIRTUAL_TERMINAL_INPUT for VT input passthrough.
+        //
+        // We do NOT use the "set mode to exactly X" pattern (which would
+        // clobber the user's QuickEdit preference) — instead we clear the
+        // flags we need to clear and add the one we need to add.
+        newMode := mode
+        newMode &^= ENABLE_ECHO_INPUT      // turn off local echo
+        newMode &^= ENABLE_LINE_INPUT      // turn off line editing (readline gets raw bytes)
+        newMode &^= ENABLE_PROCESSED_INPUT // turn off Ctrl-C / Ctrl-S signal generation
+        newMode |= ENABLE_VIRTUAL_TERMINAL_INPUT
+
+        r, _, err = procSetConsoleMode.Call(uintptr(fd), uintptr(newMode))
         if r == 0 {
                 return nil, fmt.Errorf("gspty: SetConsoleMode raw: %w", err)
         }

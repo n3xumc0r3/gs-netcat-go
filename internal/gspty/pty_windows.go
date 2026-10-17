@@ -46,6 +46,30 @@ const (
         ENABLE_VIRTUAL_TERMINAL_PROCESSING   = 0x0004
         ENABLE_PROCESSED_OUTPUT              = 0x0001
         DISABLE_NEWLINE_AUTO_RETURN          = 0x0008
+
+        // Console input mode flags (WinCon.h). SetRawStdin needs to CLEAR
+        // these to turn off the line editor / echo / signal generation that
+        // Windows does by default — equivalent to cfmakeraw() on Unix.
+        //
+        // v0.1.21: previously SetRawStdin only set ENABLE_VIRTUAL_TERMINAL_INPUT
+        // and left the default flags (which include ENABLE_ECHO_INPUT +
+        // ENABLE_LINE_INPUT) on. This caused the local console to echo every
+        // keystroke in addition to the remote PTY's echo, producing the
+        // "doubled characters" symptom the user reported. It also meant
+        // backspace / arrow keys were interpreted locally as line editing
+        // instead of being forwarded verbatim to the remote readline, which
+        // corrupted readline state and could hang the session once the
+        // prompt reached the bottom of the window (readline's redraw code
+        // path expects exclusive control of the cursor and would block
+        // waiting for an ACK that never came).
+        ENABLE_ECHO_INPUT                    = 0x0004
+        ENABLE_LINE_INPUT                    = 0x0002
+        ENABLE_PROCESSED_INPUT               = 0x0001
+        ENABLE_WINDOW_INPUT                  = 0x0008
+        ENABLE_MOUSE_INPUT                   = 0x0010
+        ENABLE_INSERT_MODE                   = 0x0020
+        ENABLE_QUICK_EDIT_MODE               = 0x0040
+        ENABLE_EXTENDED_FLAGS                = 0x0080
 )
 
 // coord is the Win32 COORD type {short X, short Y}.

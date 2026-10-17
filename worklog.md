@@ -145,3 +145,33 @@ Stage Summary:
   * PONG-tracking убирает долгий hang при dead-server
   * WSIZE hysteresis убирает stray characters и потенциальные readline deadlocks на Windows
 - README явно говорит про -i — это решает корневую причину "символов при простое" и "disconnect после нескольких команд" (raw vs in-band рассинхронизация)
+
+---
+Task ID: v0.1.21-fix
+Agent: external-audit
+Task: User reported: даже с -i и v0.1.20-fix сессия зависает после второго ls, "сразу как низа консоли достигло". Двойной echo (локальный + удалённый).
+
+Root cause:
+- SetRawStdin на Windows НЕ выключал ENABLE_ECHO_INPUT и ENABLE_LINE_INPUT.
+- Только ставил ENABLE_VIRTUAL_TERMINAL_INPUT = "VT input only".
+- Windows-консоль продолжала line-editing + echo каждого нажатия.
+- Это объясняло двойной 'ls' (один от Windows echo, один от remote PTY echo).
+- Readline зависал у нижнего края: VT escape sequences от readline scroll/redraw перехватывались локальной консолью вместо передачи на remote.
+
+Patch:
+- internal/gspty/pty_windows.go: добавлены константы ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT, ENABLE_INSERT_MODE, ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS
+- internal/gspty/termios_windows.go SetRawStdin: переписана
+  - Старт с текущего mode (preserves ENABLE_EXTENDED_FLAGS / QuickEdit pref)
+  - CLEAR: ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT
+  - ADD: ENABLE_VIRTUAL_TERMINAL_INPUT
+  - Это эквивалент cfmakeraw на Unix — raw bytes in, no local processing.
+
+Build verification:
+- go build ./...: clean
+- go test -race ./...: all packages pass
+- Built download/gs-netcat-v0.1.21-fix.exe (Windows amd64)
+
+Stage Summary:
+- ОЖИДАЕТСЯ что это решит зависание readline у нижнего края окна.
+- Двойной echo тоже должен уйти (теперь только remote PTY echo виден).
+- Если зависание останется — следующий подозреваемый: ConPTY-side PTY init size (C spawn-ит forkpty без size, ждёт первого WSIZE).
