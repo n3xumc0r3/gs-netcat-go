@@ -112,20 +112,50 @@ func SetRawStdin() (*SavedTermios, error) {
         }
         saved := &SavedTermios{fd: fd, mode: mode, saved: true}
 
-        // Build raw-mode flag set:
-        //   START from current mode (preserves ENABLE_EXTENDED_FLAGS bit
-        //   so QuickEdit doesn't get auto-re-enabled by the API).
-        //   CLEAR the line-editing / echo / signal flags.
-        //   ADD ENABLE_VIRTUAL_TERMINAL_INPUT for VT input passthrough.
+        // Build raw-mode flag set.
         //
-        // We do NOT use the "set mode to exactly X" pattern (which would
-        // clobber the user's QuickEdit preference) — instead we clear the
-        // flags we need to clear and add the one we need to add.
+        // v0.1.22: also clear ENABLE_QUICK_EDIT_MODE and ENABLE_INSERT_MODE,
+        // and explicitly set ENABLE_EXTENDED_FLAGS. This matches what
+        // OpenSSH's Windows port does.
+        //
+        // WHY DISABLE QuickEdit:
+        // QuickEdit mode (default ON in Windows 10/11) lets the user select
+        // text in the console with the mouse. When a selection starts, the
+        // console enters "selection mode" which PAUSES all console I/O:
+        //   - keystrokes are queued but not delivered to ReadFile
+        //   - output is buffered but not displayed
+        // The user exits selection mode by pressing Esc or Enter, but during
+        // the pause any in-flight keystrokes can be lost.
+        //
+        // This was the root cause of the user's "lost character" symptom:
+        // the user typed 'ls', the first 'l' was delivered, then a stray
+        // mouse click (or touchpad tap) entered selection mode, the 's' was
+        // queued, when selection mode exited the 's' was lost (Windows
+        // delivers a partial event batch in some cases).
+        //
+        // Disabling QuickEdit prevents this entire class of problems. The
+        // user can still copy text via the system menu (right-click → Mark
+        // on Windows 10, or via the title bar) but accidental clicks in the
+        // console window no longer pause I/O.
+        //
+        // WHY DISABLE InsertMode:
+        // Insert mode (also default ON) makes the console interpret Insert
+        // key as a toggle between insert and overwrite. This can confuse
+        // remote readline which has its own insert/overwrite state.
+        //
+        // WHY SET ENABLE_EXTENDED_FLAGS:
+        // This is a meta-flag that tells Windows "the QuickEdit/InsertMode
+        // bits are intentionally set". Without it, Windows ignores our
+        // QuickEdit=0 / InsertMode=0 settings and uses the defaults
+        // (QuickEdit=ON, InsertMode=ON), defeating the whole point.
         newMode := mode
-        newMode &^= ENABLE_ECHO_INPUT      // turn off local echo
-        newMode &^= ENABLE_LINE_INPUT      // turn off line editing (readline gets raw bytes)
-        newMode &^= ENABLE_PROCESSED_INPUT // turn off Ctrl-C / Ctrl-S signal generation
-        newMode |= ENABLE_VIRTUAL_TERMINAL_INPUT
+        newMode |= ENABLE_EXTENDED_FLAGS        // meta-flag: respect the bits below
+        newMode &^= ENABLE_ECHO_INPUT           // turn off local echo
+        newMode &^= ENABLE_LINE_INPUT           // turn off line editing (readline gets raw bytes)
+        newMode &^= ENABLE_PROCESSED_INPUT      // turn off Ctrl-C / Ctrl-S signal generation
+        newMode &^= ENABLE_QUICK_EDIT_MODE      // turn off QuickEdit (prevents I/O freeze on mouse click)
+        newMode &^= ENABLE_INSERT_MODE          // turn off Insert mode (don't confuse remote readline)
+        newMode |= ENABLE_VIRTUAL_TERMINAL_INPUT // VT input passthrough
 
         r, _, err = procSetConsoleMode.Call(uintptr(fd), uintptr(newMode))
         if r == 0 {

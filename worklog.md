@@ -175,3 +175,37 @@ Stage Summary:
 - ОЖИДАЕТСЯ что это решит зависание readline у нижнего края окна.
 - Двойной echo тоже должен уйти (теперь только remote PTY echo виден).
 - Если зависание останется — следующий подозреваемый: ConPTY-side PTY init size (C spawn-ит forkpty без size, ждёт первого WSIZE).
+
+---
+Task ID: v0.1.22-fix
+Agent: external-audit
+Task: User reported: v0.1.21-fix с -i — first 'ls' works, second 'ls' truncated to 'l' (the 's' was lost). bash said 'l: command not found'.
+
+Root cause: QuickEdit mode on Windows console.
+- QuickEdit is default ON in Windows 10/11.
+- Lets the user select text with the mouse.
+- When selection starts, console enters "selection mode" which PAUSES all I/O:
+  - keystrokes are queued but not delivered to ReadFile
+  - output is buffered but not displayed
+- User exits selection mode by pressing Esc or Enter, but in-flight keystrokes can be lost.
+- An accidental mouse click (or touchpad tap) during typing enters this mode.
+
+This perfectly matches the symptom: first 'l' was delivered, then a stray
+mouse click entered selection mode, 's' was queued, when selection mode
+exited the 's' was lost.
+
+Patch:
+- internal/gspty/termios_windows.go SetRawStdin:
+  - SET ENABLE_EXTENDED_FLAGS (meta-flag, tells Windows to respect QuickEdit/InsertMode bits)
+  - CLEAR ENABLE_QUICK_EDIT_MODE (prevent I/O freeze on mouse click)
+  - CLEAR ENABLE_INSERT_MODE (don't confuse remote readline)
+- Matches what OpenSSH's Windows port does.
+
+Build verification:
+- go build ./...: clean
+- go test -race ./...: all packages pass
+- Built download/gs-netcat-v0.1.22-fix.exe (Windows amd64)
+
+Stage Summary:
+- This should fix the "lost character" symptom.
+- If characters are still being lost, the next suspect is Go's Windows console input reader (known issue golang/go#12053).
