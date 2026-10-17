@@ -39,19 +39,18 @@ func newInBand() *inBand {
 }
 
 // hexdump returns a compact hex representation of b for debug logging.
-// Truncates to 64 bytes max to keep logs readable.
+// v0.1.24: NO TRUNCATION — previous version truncated at 64 bytes which
+// hid critical context (e.g. the full 182-byte paste that triggered
+// the readline hang). Now logs everything.
 func hexdump(b []byte) string {
-        n := len(b)
-        if n > 64 {
-                b = b[:64]
-        }
         const hexchars = "0123456789abcdef"
-        out := make([]byte, 0, len(b)*3+8)
+        out := make([]byte, 0, len(b)*3)
         for _, c := range b {
                 out = append(out, hexchars[c>>4], hexchars[c&0x0f], ' ')
         }
-        if n > 64 {
-                out = append(out, '.', '.', '.')
+        // Trim trailing space
+        if len(out) > 0 {
+                out = out[:len(out)-1]
         }
         return string(out)
 }

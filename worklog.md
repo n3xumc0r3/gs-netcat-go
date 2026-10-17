@@ -239,3 +239,59 @@ Build:
 User should run:
   .\gs-netcat.exe -i -vvv -s <secret> 2> log.txt
 ...reproduce the freeze, then send log.txt
+
+---
+Task ID: v0.1.24-debug
+Agent: external-audit
+Task: User provided log.txt from v0.1.23-debug. Analysis:
+
+KEY FINDINGS FROM USER'S LOG:
+
+1. WSIZE sent correctly: fb 01 00 78 00 1e = 120x30. OK.
+
+2. Server greeting + prompt received correctly. Bracketed paste mode ON (\x1b[?2004h).
+
+3. CRITICAL: User pasted 182 bytes into the terminal:
+   WRITE app-data: 182 bytes: 0d 23 20 d0 92 d0 be d1 81 d0 bf ...
+   Decoded: \r# Введите: один-два ls, дождит...
+   This was MY OWN TEXT from a previous reply that the user accidentally copy-pasted into bash.
+   The '#' made bash treat it as a comment.
+
+4. Bash echoed it back (269 bytes — but truncated at 64 in our hexdump).
+   Then user pressed Enter (0d), bash returned prompt (44 bytes). OK.
+
+5. CRITICAL: User typed Russian 'ды' (UTF-8 d0 b4 d1 8b):
+   WRITE 2 bytes: d0 b4   (UTF-8 'д')
+   WIRE-IN 2 bytes: 3a b4 ← CORRUPTED ECHO! Should be d0 b4, got :b4
+   The first byte 0xd0 was transformed to 0x3a (':').
+
+6. User pressed backspace 3 times (7f). Bash echoed backspace correctly (08 1b 5b 4b).
+
+7. User typed 'ls' + Enter (6c 73 0d).
+   NO RESPONSE FROM BASH. Bash readline appears to be in a broken state.
+
+8. User spammed Enter (10x 0d) — no response.
+   User spammed Ctrl-C (15x 03) — no response.
+   User started clicking mouse — Windows Terminal sent mouse tracking events
+   (\x1b[<35;56;12M format) which flooded the wire.
+
+CONCLUSION: The hang is NOT in the Go client. The Go client correctly sends bytes
+and the TLS connection stays alive (no Write errors). The problem is that
+bash readline on the server entered a broken state after:
+- The user pasted 182 bytes of text starting with \r (which ICRNL converts to \n),
+  potentially including embedded newlines that bash executed as separate commands
+- Then typed UTF-8 Russian characters which got corrupted echo (d0 → 3a)
+- Then readline stopped responding to ls + Enter
+
+The corrupted echo (d0 → 3a) is suspicious. It might indicate that bash
+readline is in a vi command mode or some special state where it interprets
+input bytes as commands rather than echo'ing them.
+
+The full 182-byte paste content is hidden because hexdump was truncated
+at 64 bytes. v0.1.24-debug removes the truncation so we can see the
+full paste and the full 269-byte server echo.
+
+Action: remove hexdump truncation, ship v0.1.24-debug, ask user to:
+1. First test: just type 'ls' manually (no paste) — does it hang?
+2. If yes: send full log without truncation
+3. If no: the hang is triggered by paste, recommend 'bind 'set enable-bracketed-paste off''
