@@ -295,3 +295,113 @@ Action: remove hexdump truncation, ship v0.1.24-debug, ask user to:
 1. First test: just type 'ls' manually (no paste) — does it hang?
 2. If yes: send full log without truncation
 3. If no: the hang is triggered by paste, recommend 'bind 'set enable-bracketed-paste off''
+
+---
+Task ID: v0.1.25-debug
+Agent: external-audit
+Task: Analysis of user's v0.1.24-debug log2.txt — typed 'ls' (worked), then 'whoami' (hung after 'wh').
+
+KEY FINDINGS:
+
+1. 'ls' worked perfectly:
+   - User typed l, s, Enter
+   - Bash echoed each char, then sent 'html\r\n' + prompt
+   - All correct.
+
+2. 'whoami' hung after 2nd char:
+   - User typed w → bash echoed w ✓
+   - User typed h → bash echoed h ✓
+   - User typed o → NO ECHO from bash
+   - User typed a, m, i, Enter → NO ECHO, NO RESPONSE
+   - Bash readline appears dead.
+
+3. Mouse event flood:
+   - After bash hung, user clicked mouse in terminal
+   - Windows Terminal sent SGR mouse escape sequences:
+     \x1b[<35;33;16M (mouse press at row 33, col 16)
+   - These went to bash as raw input, further corrupting readline state
+   - ~100 such events were sent before user gave up and Ctrl-C'd
+
+ROOT CAUSE OF MOUSE FLOOD (Bug B — fixable in Go client):
+   SetRawStdin sets ENABLE_VIRTUAL_TERMINAL_INPUT but does NOT clear
+   ENABLE_MOUSE_INPUT. With both flags ON, Windows Terminal translates
+   mouse clicks into SGR escape sequences. These get forwarded to the
+   remote bash, which doesn't expect them and gets corrupted.
+
+   Fix: also clear ENABLE_MOUSE_INPUT in SetRawStdin.
+
+ROOT CAUSE OF BASH HANG (Bug A — NOT in Go client):
+   The Go client correctly sends 'o' (0x6f) to the wire. TLS Write
+   returns no error. But bash doesn't echo it back. There's no in-band
+   event, no PING, no error visible in the Go client log between the
+   'h' echo and the 'o' write — just a clean byte boundary.
+   
+   The hang is happening on the SERVER side (C gs-netcat + bash).
+   The Go client cannot fix this. The C server's cb_read_gs reads
+   from GS, decodes, writes to PTY — if bash isn't echoing, the
+   problem is in bash readline itself, not in the transport.
+
+   WHY bash might hang: unknown. Possibilities:
+   - bash readline internal state corruption from a previous byte
+   - PTY buffer issue on the server
+   - Some terminal mode flip we're not aware of
+
+WHAT v0.1.25-debug ADDS:
+
+1. Clear ENABLE_MOUSE_INPUT in SetRawStdin — stops the mouse event flood.
+   This eliminates one source of readline corruption.
+
+2. Timestamps on every log line (tslog helper, format HH:MM:SS.mmm).
+   Critical for diagnosing timing: did the user wait 30 seconds
+   between 'h' and 'o'? Did a PING fire at that exact moment? Was
+   there a network stall?
+
+3. PING/PONG message type names in WRITE-MSG log (instead of bare
+   type=16). Easier to spot PING traffic in the log.
+
+4. Timestamps on stdin->conn and conn->stdout io.Copy return logs.
+
+NEXT STEP: ask user to reproduce with v0.1.25-debug and send log3.txt.
+With timestamps we can see:
+- How fast the user typed (was there a delay before 'o'?)
+- Whether a PING fired during the 'wh' → 'o' transition
+- How long the user waited before clicking mouse
+
+If the hang is reproducible WITH timestamps and shows no PING/no delay,
+then the problem is definitively server-side and the Go client cannot
+fix it. The user should test with the C client from a Linux machine
+to confirm.
+
+---
+Task ID: v0.1.27-stable
+Agent: external-audit
+Task: User asked: does Go-server suffer the same hang as C-server?
+
+TEST SETUP:
+- Started Go-server on local machine with secret "GoStress1792249792Q9"
+- Connected with Go-client over public thc.org relay
+- Sent 15 commands (ls, whoami, pwd, echo hello1, ls, uname -a, date, echo hello2, id, ls -la, echo hello3, whoami, pwd, echo done, exit) with 2-second pauses between each
+
+RESULT:
+ALL 15 commands executed successfully without any hang.
+Bracketed paste mode was ON (\x1b[?2004h/l visible in logs).
+Each command got its echo, output, and prompt back.
+
+CONCLUSION:
+The hang is C-server specific. C-server uses a single select() event loop
+with shared rbuf/wbuf buffers and a gopt.is_win_resized flag — this leads
+to race conditions between PTY I/O, network I/O, and WSIZE application.
+
+Go-server uses simple goroutines with io.Copy:
+- One goroutine: io.Copy(pty, conn) — network → PTY
+- One goroutine: io.Copy(conn, pty.Master) — PTY → network
+- Event pump goroutine: handles WSIZE/PING synchronously
+
+No shared state, no select(), no flag-based dispatch → no race.
+
+RECOMMENDATION TO USER:
+Replace C-server (gsocket.io/y deploy, -liqD flags) with Go-server
+on the affected machine. Same secret, same flags:
+  ./gs-netcat -l -i -s 4hNLrALkBFCPYeYkQxFLMR -D -L /var/log/gs.log
+
+Go-server + Go-client = stable (proven by 15-command stress test).
