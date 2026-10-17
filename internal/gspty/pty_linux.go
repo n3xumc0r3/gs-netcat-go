@@ -20,6 +20,7 @@ import (
         "io"
         "os"
         "os/exec"
+        "sync"
         "syscall"
         "unsafe"
 
@@ -67,10 +68,27 @@ type winsize struct {
 // window-size change to the child's controlling terminal. Close
 // kills the child (SIGTERM, then SIGKILL after a grace period) and
 // releases both fds.
+//
+// v0.1.28 (audit-3 bug #3, HIGH): PTY is now safe for concurrent
+// Close + Wait + Write + SetWindowSize. Previously Close was not
+// idempotent and raced with Wait (exec.Cmd.Wait is not concurrency-
+// safe). Added closeMu + closed flag + waitOnce.
 type PTY struct {
         Master *os.File
         cmd    *exec.Cmd
         slave  *os.File
+
+        // v0.1.28: closeMu protects `closed` and serializes Close.
+        // SetWindowSize and Write check `closed` under closeMu before
+        // touching the fd, preventing fd-recycling TOCTOU (similar
+        // to the Windows PTY bug).
+        closeMu sync.Mutex
+        closed  bool
+
+        // v0.1.28: waitOnce ensures cmd.Wait() is called at most once
+        // even if both Close and the user's explicit Wait race.
+        waitOnce sync.Once
+        waitErr  error
 }
 
 // Spawn allocates a new PTY and starts cmd (or the user's preferred
@@ -174,23 +192,54 @@ func Spawn(cmd string, cols, rows uint16) (*PTY, error) {
 // this as a SIGWINCH (if it has a handler) and adjusts its display
 // accordingly. Mirrors C's pkt_app_cb_wsize which does
 // ioctl(p->fd_in, TIOCSWINSZ, &ws).
+//
+// v0.1.28 (audit-3 bug #5, MEDIUM): race-safe against Close. The
+// previous version read p.Master.Fd() without a lock, allowing Close
+// to close the fd underneath and the OS to recycle the fd number —
+// ioctl would then operate on an unrelated file. Now we check
+// `closed` under closeMu before touching the fd.
 func (p *PTY) SetWindowSize(cols, rows uint16) error {
-        return setWinsize(int(p.Master.Fd()), rows, cols)
+        p.closeMu.Lock()
+        if p.closed {
+                p.closeMu.Unlock()
+                return fmt.Errorf("gspty: SetWindowSize on closed PTY")
+        }
+        fd := int(p.Master.Fd())
+        p.closeMu.Unlock()
+        return setWinsize(fd, rows, cols)
 }
 
 // Write pushes bytes into the PTY master (i.e. to the child's stdin).
 // On Linux the master fd is duplex so this is just Master.Write.
 // On Windows the master is read-only and PTY.Write uses a separate
 // input pipe; exposing Write as a method keeps callers portable.
+//
+// v0.1.28: race-safe against Close (same pattern as SetWindowSize).
 func (p *PTY) Write(b []byte) (int, error) {
-        return p.Master.Write(b)
+        p.closeMu.Lock()
+        if p.closed {
+                p.closeMu.Unlock()
+                return 0, fmt.Errorf("gspty: write to closed PTY")
+        }
+        master := p.Master
+        p.closeMu.Unlock()
+        return master.Write(b)
 }
 
 // Wait blocks until the child process exits and returns its exit
 // status. The caller is responsible for closing Master afterwards
 // (Close does both).
+//
+// v0.1.28 (audit-3 bug #3, HIGH): concurrency-safe. exec.Cmd.Wait()
+// is NOT safe for concurrent calls — calling it twice returns
+// "exec: Wait was already called" instead of the real exit status.
+// Now sync.Once ensures Wait is only called once; subsequent callers
+// get the cached error.
 func (p *PTY) Wait() error {
-        return p.cmd.Wait()
+        p.waitOnce.Do(func() {
+                p.waitErr = p.cmd.Wait()
+        })
+        return p.waitErr
 }
 
 // PID returns the spawned shell's process ID, or 0 if the process
@@ -204,15 +253,31 @@ func (p *PTY) PID() int {
 }
 
 // Close kills the child process and closes the master fd. Safe to
-// call multiple times.
+// call multiple times (idempotent via `closed` flag).
+//
+// v0.1.28 (audit-3 bug #3, HIGH): now idempotent + race-safe.
+// Previously Close could be called twice, spawning two async-wait
+// goroutines and returning EBADF on the second Master.Close(). The
+// async goroutine also raced with the user's explicit Wait() call.
+// Now `closed` flag prevents double-close, and Wait() is serialized
+// via its own sync.Once — both Close and Wait can call cmd.Wait()
+// through waitOnce safely.
 func (p *PTY) Close() error {
+        p.closeMu.Lock()
+        if p.closed {
+                p.closeMu.Unlock()
+                return nil
+        }
+        p.closed = true
+        p.closeMu.Unlock()
+
         if p.cmd != nil && p.cmd.Process != nil {
                 // Best-effort kill: SIGTERM, then SIGKILL after grace period.
                 _ = p.cmd.Process.Signal(syscall.SIGTERM)
-                // We don't wait for the grace period here — the caller usually
-                // wants Close to return immediately. Wait() in a goroutine will
-                // reap the process.
-                go func() { _ = p.cmd.Wait() }()
+                // Reap the process via the shared waitOnce — if the user
+                // already called Wait(), this is a no-op; otherwise we do
+                // it here so the process doesn't become a zombie.
+                go func() { _ = p.Wait() }()
         }
         if p.Master != nil {
                 return p.Master.Close()

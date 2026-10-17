@@ -87,6 +87,13 @@ func utmpEntriesFromFile(path string) ([]UtmpEntry, bool) {
 
 // parseUtmp parses raw utmp bytes into entries. Returns (nil, false)
 // if len(data) is not a multiple of utmpLinuxEntrySize.
+//
+// v0.1.28 (audit-4 bug #7, LOW): ut_type is `short int` (2 bytes) in
+// glibc's struct utmp, NOT int32. The previous code read 4 bytes
+// (including 2 padding bytes) and interpreted them as int32. On x86
+// the padding is zero so the value was correct in practice, but on
+// any architecture where padding is non-zero this would break. Now
+// we read ut_type as int16 (2 bytes) and zero-extend to int32.
 func parseUtmp(data []byte) ([]UtmpEntry, bool) {
         if len(data)%utmpLinuxEntrySize != 0 {
                 return nil, false
@@ -94,7 +101,8 @@ func parseUtmp(data []byte) ([]UtmpEntry, bool) {
         var entries []UtmpEntry
         for off := 0; off+utmpLinuxEntrySize <= len(data); off += utmpLinuxEntrySize {
                 ent := data[off : off+utmpLinuxEntrySize]
-                utType := int32(ent[0]) | int32(ent[1])<<8 | int32(ent[2])<<16 | int32(ent[3])<<24
+                // ut_type is `short int` at offset 0 — 2 bytes, little-endian.
+                utType := int32(int16(uint16(ent[0])|uint16(ent[1])<<8))
                 if utType != utmpTypeUserProc {
                         continue
                 }

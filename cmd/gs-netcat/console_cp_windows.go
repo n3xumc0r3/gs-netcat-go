@@ -31,10 +31,9 @@ import (
 // On non-Windows this file is not compiled; console_cp_unix.go has a
 // no-op init().
 //
-// We also set _GSOCKET_CHILDCP_UTF8=1 in the env so any child process
-// (e.g. the shell spawned in -i mode) can pick up the same setting.
-// Bash on Windows (Cygwin/MSYS2) ignores this, but cmd.exe and
-// PowerShell honour the console CP set by SetConsoleOutputCP.
+// v0.1.28 (audit-4 bug #8, LOW): the comment claimed we set
+// _GSOCKET_CHILDCP_UTF8=1 in the env, but the code never called
+// os.Setenv. Now we actually set it.
 func init() {
         // CP_UTF8 = 65001 (Windows code page identifier for UTF-8).
         // golang.org/x/sys/windows doesn't export this constant; we use
@@ -46,6 +45,10 @@ func init() {
                 fmt.Fprintf(os.Stderr, "[gs-netcat] warning: SetConsoleOutputCP failed: %v\n", err)
         }
         _ = windows.SetConsoleCP(cpUTF8)
+
+        // v0.1.28: actually set the env var the comment promised.
+        // Children (e.g. shell spawned in -i mode) can pick this up.
+        os.Setenv("_GSOCKET_CHILDCP_UTF8", "1")
 
         // Enable ANSI escape-sequence processing on stdout/stderr.
         enableVT(os.Stdout)

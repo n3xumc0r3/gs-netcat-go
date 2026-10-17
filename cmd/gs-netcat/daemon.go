@@ -95,11 +95,20 @@ func daemonizeAndOrWatchdog(args []string, daemon, watchdog bool, verbose bool) 
                         // Detached mode: stdio → DEVNULL, no terminal attachment.
                         // On Unix this approximates setsid() via Setpgid.
                         // On Windows this hides the console window.
+                        //
+                        // v0.1.28 (audit-1 bug #1, HIGH): close devNull after
+                        // cmd.Start() succeeds. The child inherits its own copy
+                        // of the fd via exec; the parent's copy must be closed
+                        // to avoid fd leak. Previously in -D -W mode, every
+                        // restart iteration leaked one fd → after ~1024
+                        // iterations the parent hit RLIMIT_NOFILE and silently
+                        // died.
                         devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
                         if err == nil {
                                 cmd.Stdin = devNull
                                 cmd.Stdout = devNull
                                 cmd.Stderr = devNull
+                                defer devNull.Close() // closed after Start() inherits it
                         }
                         setDetachedAttrs(cmd)
                 } else {

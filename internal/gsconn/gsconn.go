@@ -188,10 +188,10 @@ type Conn struct {
         pktMu sync.Mutex
         ib    *inBand
 
-        // closeMu guards closeHooks and closed. closed ensures Close
-        // (and the hooks) run at most once even if Close is called
-        // concurrently from multiple goroutines (e.g. user-initiated
-        // shutdown + remote-closed detection).
+        // closeMu guards closeHooks only. The actual close sequence
+        // (runCloseHooks + close(stopPing) + rawConn.Close + close events)
+        // is serialized via closeOnce (sync.Once) — this is the v0.1.28
+        // fix for the Close-race panic.
         //
         // OnClose hooks registered after Close has already run are
         // invoked immediately (so cleanup still happens — important
@@ -199,6 +199,11 @@ type Conn struct {
         closeMu    sync.Mutex
         closed     bool
         closeHooks []func()
+
+        // closeOnce serializes the entire Close sequence. closeErr is
+        // written by the once.Do func and read by all subsequent callers.
+        closeOnce sync.Once
+        closeErr  error
 }
 
 // Read reads decoded application data from the connection.
@@ -329,9 +334,16 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
         // doesn't respond with ServerHello quickly enough. By starting the
         // computation now (before we even register with the relay), the
         // verifier will be ready by the time a connector connects.
-        // (For connect mode we're the TLS client, no verifier needed.)
+        //
+        // v0.1.28 (audit-2 bug #3, MEDIUM): Also precompute for ModeConnect
+        // when the -A flag (FlagClientOrServer) is set — the relay may
+        // assign us RoleServer, in which case we need the verifier.
+        // Without this, `-A` on the connect side fails TLS handshake
+        // when the relay flips our role.
         var serverLookup *onTheFlyLookup
-        if mode == ModeListen {
+        needServerLookup := mode == ModeListen ||
+                (mode == ModeConnect && opts.FlagExtra&gsrn.FlagClientOrServer != 0)
+        if needServerLookup {
                 serverLookup = &onTheFlyLookup{
                         user:     gskdf.SRPUsername,
                         password: creds.SRPPassword,
@@ -490,12 +502,20 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
                 fmt.Fprintf(os.Stderr, "[gsport] accept sent (after %v)\n", time.Since(tAccept))
         }
 
-        // Clear the deadline — application data flows under no deadline
-        // (caller may set its own via SetDeadline).
-        _ = relay.SetDeadline(time.Time{})
-        if os.Getenv("GSPORT_DEBUG") != "" {
-                fmt.Fprintf(os.Stderr, "[gsport] deadline cleared, ready for %s\n",
-                        map[bool]string{true: "raw data flow (-C)", false: "TLS handshake"}[opts.NoEncryption])
+        // v0.1.28 (audit-2 bug #2, HIGH): Clear deadline AFTER the TLS
+        // handshake, not before. The previous code cleared the deadline
+        // here (before Handshake()), contradicting the documented safety
+        // property. A peer that completes _gs_start but hangs mid-TLS
+        // would leave the connection blocked indefinitely.
+        //
+        // For the NoEncryption path, no TLS handshake follows, so we
+        // can clear immediately. For the TLS path, keep the deadline
+        // active until Handshake() returns.
+        if opts.NoEncryption {
+                _ = relay.SetDeadline(time.Time{})
+                if os.Getenv("GSPORT_DEBUG") != "" {
+                        fmt.Fprintf(os.Stderr, "[gsport] deadline cleared, ready for raw data flow (-C)\n")
+                }
         }
 
         // -C (NoEncryption): skip TLS-SRP entirely. The relay TCP is the
@@ -571,6 +591,15 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
         }
         if os.Getenv("GSPORT_DEBUG") != "" {
                 fmt.Fprintf(os.Stderr, "[gsport] TLS handshake completed (took %v)\n", time.Since(tHandshake))
+        }
+
+        // v0.1.28: NOW clear the deadline — TLS handshake succeeded,
+        // application data flows under no deadline (caller may set its
+        // own via SetDeadline). This is the correct place: after Handshake
+        // returns successfully.
+        _ = relay.SetDeadline(time.Time{})
+        if os.Getenv("GSPORT_DEBUG") != "" {
+                fmt.Fprintf(os.Stderr, "[gsport] deadline cleared after TLS handshake\n")
         }
 
         c := &Conn{
@@ -658,53 +687,40 @@ func (c *Conn) runCloseHooks() {
 }
 
 // Close tears down the connection and stops the keepalive goroutine.
-// Idempotent: subsequent calls are no-ops (runCloseHooks is only run
-// once thanks to the closed flag).
+// Idempotent AND concurrency-safe: uses sync.Once for the entire
+// close sequence so concurrent Close calls (e.g. user-Close +
+// inBandPinger-dead-server-Close) cannot panic on close-of-closed-channel.
+//
+// v0.1.28 (audit-2 bug #1, HIGH): Previously the `closed` check and
+// `closed = true` set were not atomic (separated by lock release +
+// runCloseHooks). Two goroutines could both pass the check, both
+// reach `select { default: close(c.stopPing) }`, and both call
+// close(c.stopPing) → panic. Now the entire close sequence is wrapped
+// in sync.Once.
 func (c *Conn) Close() error {
-        c.closeMu.Lock()
-        if c.closed {
-                c.closeMu.Unlock()
-                return nil
-        }
-        c.closeMu.Unlock()
-        c.runCloseHooks()
+        c.closeOnce.Do(func() {
+                c.runCloseHooks()
 
-        select {
-        case <-c.stopPing:
-                // already closed
-        default:
+                // Close stopPing signal channel (safe — once.Do guarantees
+                // we're the only one here).
                 close(c.stopPing)
-        }
-        // tlssrp.Conn.Close() will close the underlying relay TCP.
-        err := c.rawConn.Close()
-        // Drain and close the events channel so the event-pump goroutine
-        // (if any) can exit its range loop. Close is the only writer to
-        // c.ib.events (Read pushes are also from this Conn's owner); we
-        // take care to close only once via stopPing's once-semantics.
-        if c.ib != nil {
-                // Atomically (under pktMu):
-                //   1. mark proto as EOF so inBandRead short-circuits
-                //   2. set eventsClosed so inBandRead stops trying to send
-                //   3. close the events channel so eventPump's range loop
-                //      exits and the goroutine doesn't leak.
-                //
-                // Safe because:
-                //   - the only writer to c.ib.events is inBandRead, which
-                //     holds pktMu — and we hold it here too, so we're
-                //     serialized with any in-progress send.
-                //   - inBandRead checks `eventsClosed` before sending, so
-                //     no send-to-closed-channel panic is possible.
-                //   - close() is itself a one-shot operation; the once-flag
-                //     protects against double-close from idempotent Close.
-                c.pktMu.Lock()
-                c.ib.proto = io.EOF
-                if !c.ib.eventsClosed {
-                        c.ib.eventsClosed = true
-                        close(c.ib.events)
+
+                // tlssrp.Conn.Close() will close the underlying relay TCP.
+                c.closeErr = c.rawConn.Close()
+
+                // Drain and close the events channel so the event-pump goroutine
+                // (if any) can exit its range loop.
+                if c.ib != nil {
+                        c.pktMu.Lock()
+                        c.ib.proto = io.EOF
+                        if !c.ib.eventsClosed {
+                                c.ib.eventsClosed = true
+                                close(c.ib.events)
+                        }
+                        c.pktMu.Unlock()
                 }
-                c.pktMu.Unlock()
-        }
-        return err
+        })
+        return c.closeErr
 }
 
 // pingerStub is a no-op placeholder for the keepalive goroutine in raw

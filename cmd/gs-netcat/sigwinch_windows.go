@@ -43,8 +43,14 @@ import (
 //      the size to stabilize before emitting the event. This coalesces
 //      a burst of resize events (e.g. during a window drag) into one
 //      final event with the settled size.
-func watchWindowSize() <-chan struct{} {
+//
+// v0.1.28 (audit-4 bug #5, MEDIUM): returns a stop function so the
+// polling goroutine can be torn down when the caller is done.
+// Previously the goroutine leaked permanently per interactive client
+// session.
+func watchWindowSize() (<-chan struct{}, func()) {
         ch := make(chan struct{}, 1)
+        done := make(chan struct{})
         go func() {
                 var prevCols, prevRows uint16
                 // Initialize with the current size so we don't fire a spurious
@@ -67,7 +73,12 @@ func watchWindowSize() <-chan struct{} {
 
                 t := time.NewTicker(250 * time.Millisecond)
                 defer t.Stop()
-                for range t.C {
+                for {
+                        select {
+                        case <-done:
+                                return
+                        case <-t.C:
+                        }
                         c, r := gspty.GetStdinWindowSize()
 
                         // Hysteresis: ignore changes ≤ hysteresis pixels.
@@ -116,7 +127,8 @@ func watchWindowSize() <-chan struct{} {
                         }
                 }
         }()
-        return ch
+        stop := func() { close(done) }
+        return ch, stop
 }
 
 // absInt returns |x|. Tiny helper to avoid pulling in math.Abs (float).

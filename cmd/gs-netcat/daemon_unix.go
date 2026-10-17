@@ -9,18 +9,20 @@ import (
 )
 
 // setDetachedAttrs configures an *exec.Cmd to run detached from the
-// controlling terminal on Unix-like systems. Go's os/exec doesn't
-// expose setsid() directly; we use Setpgid=true (child becomes its
-// own process-group leader, which is close enough for daemon semantics:
-// the child is no longer in the parent's process group, so signals
-// sent to the parent's group don't propagate to the child, and the
-// child has no controlling tty once the parent exits).
+// controlling terminal on Unix-like systems.
 //
-// For a true setsid we'd need to use syscall.Syscall(SYS_SETSID, ...)
-// inside the child — which Go doesn't support pre-exec. Setpgid is
-// the standard workaround used by, e.g., daemonize libraries.
+// v0.1.28 (audit-4 bug #2, MEDIUM): use Setsid=true (real setsid)
+// instead of just Setpgid=true. The previous comment claimed Go
+// doesn't expose setsid — false, syscall.SysProcAttr.Setsid exists
+// on Linux and calls SYS_SETSID via the child's pre-exec hook.
+// Without Setsid the detached daemon retains the controlling terminal
+// and dies on SIGHUP when the parent's session ends. Setpgid alone
+// only detaches from the parent's process group, not the session.
+//
+// Setsid also implies Setpgid (the new session leader is a new
+// process group leader by definition), so we don't need to set both.
 func setDetachedAttrs(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+		Setsid: true,
 	}
 }

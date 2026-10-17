@@ -138,9 +138,25 @@ func GenSecret() (string, error) {
         // Treat buf as a big-endian unsigned integer, repeatedly divmod by 58.
         // This is the standard base58 encoding (no checksum, unlike Bitcoin's
         // base58check).
+        // v0.1.28 (audit-4 bug #10, LOW): handle leading zero bytes.
+        // Standard base58 (Bitcoin BIP) maps each leading 0x00 byte to
+        // a '1' prefix. The previous code skipped leading zero bytes
+        // entirely (because `acc < 58 && !started`), so secrets with
+        // a leading 0x00 byte in the random buffer (≈0.4% of secrets)
+        // were shorter than targetLen and diverged from C gs-netcat's
+        // base58 output. Now we emit one '1' per leading zero byte,
+        // matching Bitcoin/C convention.
+        leadingZeros := 0
+        for leadingZeros < len(buf) && buf[leadingZeros] == 0 {
+                leadingZeros++
+        }
         num := make([]byte, len(buf))
         copy(num, buf)
         out := make([]byte, 0, targetLen+4)
+        // Emit one base58 '1' per leading zero byte (matches Bitcoin/C).
+        for i := 0; i < leadingZeros; i++ {
+                out = append(out, alphabet[0]) // alphabet[0] == '1'
+        }
         for {
                 // Divide num by 58, remainder in acc.
                 var acc int

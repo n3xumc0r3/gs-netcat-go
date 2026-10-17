@@ -134,24 +134,49 @@ func (m *Manager) subscribe(conn *gsconn.Conn) func() {
         return func() {
                 m.mu.Lock()
                 delete(m.subs, conn)
+                // v0.1.28 (audit-4 bug #1, HIGH): capture stopCh under the
+                // lock so we don't race with run()'s select reading it.
+                // Previously run() read m.stopCh without holding mu, so a
+                // new subscribe() could replace m.stopCh before run() saw
+                // the close — leaking run() forever + duplicating ticks.
+                var stopCh chan struct{}
                 if len(m.subs) == 0 && m.started {
-                        close(m.stopCh)
+                        stopCh = m.stopCh
                         m.started = false
+                        m.stopCh = nil
                 }
                 m.mu.Unlock()
+                // Close outside the lock to avoid run()'s select blocking
+                // on mu acquisition if it's currently in tick() (which also
+                // holds mu).
+                if stopCh != nil {
+                        close(stopCh)
+                }
         }
 }
 
 // run is the background ticker goroutine. Started on first subscribe,
 // stopped when the last subscriber leaves.
+//
+// v0.1.28: read m.stopCh once at start, then never re-read it. The
+// stopCh value can be replaced by subscribe() (when started=true
+// creates a new channel) but THIS goroutine's lifetime is tied to
+// the stopCh we captured at startup — the new stopCh belongs to the
+// next run() goroutine that subscribe() spawns.
 func (m *Manager) run() {
+        m.mu.Lock()
+        stopCh := m.stopCh
+        m.mu.Unlock()
+        if stopCh == nil {
+                return // defensive; shouldn't happen
+        }
         ticker := time.NewTicker(tickInterval)
         defer ticker.Stop()
         for {
                 select {
                 case <-ticker.C:
                         m.tick()
-                case <-m.stopCh:
+                case <-stopCh:
                         return
                 }
         }
@@ -274,18 +299,23 @@ func (m *Manager) events(entries []gsstats.UtmpEntry, now int64) (newLogins, new
 // matches struct _pkt_app_log in tools/pkt_mgr.h:
 //
 //      [0]    type   — log type (ALERT/NOTICE/INFO/DEFAULT)
-//      [1:64] msg    — NUL-padded, max 63 chars
+//      [1:64] msg    — NUL-padded, max 62 chars + NUL
 //
-// The message is truncated to 63 bytes (matches C's "%.62s" snprintf
-// which reserves 1 byte for the implicit NUL).
+// v0.1.28 (audit-4 bug #6, LOW): truncate to 62 bytes, not 63.
+// The C original uses `snprintf(%.62s)` which reserves 1 byte for
+// the implicit NUL terminator (62 chars + NUL = 63 bytes in the
+// 64-byte field). The previous code truncated to 63, leaving no
+// room for the NUL — a latent wire-compat mismatch that could
+// confuse the peer's NUL-terminated string handling.
 func sendLog(conn *gsconn.Conn, logType uint8, msg string) {
         payload := make([]byte, 64)
         payload[0] = logType
-        if len(msg) > 63 {
-                msg = msg[:63]
+        if len(msg) > 62 {
+                msg = msg[:62]
         }
         copy(payload[1:64], []byte(msg))
-        // payload[1+len(msg):64] is already 0 from make().
+        // payload[1+len(msg):64] is already 0 from make() — that zero
+        // at position 1+len(msg) is the NUL terminator.
         _ = conn.WriteMsg(gspkt.MsgLOG, payload)
 }
 

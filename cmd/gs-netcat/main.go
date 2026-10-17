@@ -219,7 +219,7 @@ Example for an interactive session:
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.27-stable"
+        const defaultVersion = "v0.1.28-audit"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -469,7 +469,13 @@ Example for an interactive session:
         // SRP identity across reconnects (the C code derives the token from
         // the secret once and never regenerates it for the lifetime of the
         // process).
-        if listen && interactive && opts.AuthToken == "" {
+        // v0.1.28 (audit-1 bug #2, HIGH): widen `listen && interactive` to
+        // just `listen` — port-forward server mode (listen && !interactive)
+        // ALSO needs a stable token to avoid BAD_AUTH on reconnect.
+        // Without this, each gsconn.Dial(ModeListen) in runPortForwardServer's
+        // reconnect loop generates a new random wire token, and the relay
+        // rejects it because the previous slot is still occupied.
+        if listen && opts.AuthToken == "" {
                 var randBuf [16]byte
                 if _, err := rand.Read(randBuf[:]); err == nil {
                         opts.AuthToken = hex.EncodeToString(randBuf[:])
@@ -611,20 +617,34 @@ Example for an interactive session:
         // send CloseWrite, and the remote would stop sending after a few
         // KB. This was the root cause of 1 MB C→Go transfers being
         // truncated to 4 KB.
+        // v0.1.28 (audit-1 bug #4 + #5, MEDIUM): fix gotRemoteData timing
+        // + data race on totalWritten/totalRead.
+        //
+        // BUG 1: gotRemoteData was stored AFTER io.Copy returned (i.e. when
+        // remote had already closed). The bi-directional CloseWrite branch
+        // was therefore unreachable. Now we wrap conn in a trackingReader
+        // that sets gotRemoteData=1 on the FIRST successful Read, before
+        // io.Copy returns.
+        //
+        // BUG 2: totalWritten/totalRead were written by goroutines and read
+        // from the main goroutine without synchronization. Now they're
+        // atomic.Int64.
         stdinDone := make(chan struct{})
         remoteClosed := make(chan struct{})
-        var totalWritten int64
-        var totalRead int64
-        var gotRemoteData int32 // atomic; 1 once we've received any bytes
+        var totalWritten atomic.Int64
+        var totalRead atomic.Int64
+        var gotRemoteData atomic.Int32 // 1 once we've received any bytes from remote
+        // trackingReader sets gotRemoteData=1 on first successful Read.
+        // This is the v0.1.28 fix for the inverted heuristic.
+        connReader := &trackingReader{r: conn, flag: &gotRemoteData}
         go func() {
                 n, _ := io.Copy(conn, os.Stdin)
-                totalWritten = n
+                totalWritten.Store(n)
                 close(stdinDone)
         }()
         go func() {
-                n, _ := io.Copy(os.Stdout, conn)
-                atomic.StoreInt32(&gotRemoteData, 1)
-                totalRead = n
+                n, _ := io.Copy(os.Stdout, connReader)
+                totalRead.Store(n)
                 close(remoteClosed)
         }()
 
@@ -645,7 +665,7 @@ Example for an interactive session:
                 case <-remoteClosed:
                         // Remote closed before we did anything. Just exit.
                 case <-stdinDone:
-                        if atomic.LoadInt32(&gotRemoteData) == 1 {
+                        if gotRemoteData.Load() == 1 {
                                 // Already got data from remote — bi-directional session.
                                 _ = conn.CloseWrite()
                                 <-remoteClosed
@@ -659,7 +679,8 @@ Example for an interactive session:
         }
 
         if os.Getenv("GSPORT_DEBUG") != "" {
-                fmt.Fprintf(os.Stderr, "[gsport] done; totalWritten=%d totalRead=%d\n", totalWritten, totalRead)
+                fmt.Fprintf(os.Stderr, "[gsport] done; totalWritten=%d totalRead=%d\n",
+                        totalWritten.Load(), totalRead.Load())
         }
         if verbose {
                 log.Printf("connection closed")
@@ -892,7 +913,10 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
         // Install window-size watcher: on resize, query new size and re-send.
         // On Unix this wraps SIGWINCH; on Windows it polls every 250ms
         // (Windows has no SIGWINCH equivalent).
-        resizeCh := watchWindowSize()
+        // v0.1.28: watchWindowSize now returns a stop function so the
+        // polling/SIGWINCH goroutine can be torn down when the session
+        // ends. Previously this leaked 2 goroutines per session.
+        resizeCh, resizeStop := watchWindowSize()
         go func() {
                 for range resizeCh {
                         c, r := gspty.GetStdinWindowSize()
@@ -904,6 +928,7 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
                         }
                 }
         }()
+        defer resizeStop()
 
         // Pipe stdin -> conn, conn -> stdout.
         stdinDone := make(chan struct{})
@@ -1372,4 +1397,27 @@ func manPageText() string {
                 out[i] = b ^ manPageKey[i%len(manPageKey)]
         }
         return string(out)
+}
+
+// trackingReader wraps an io.Reader and atomically sets *flag to 1
+// on the first successful Read (n > 0). Used by runInteractive's raw
+// cat mode to distinguish "remote sent data" from "remote closed"
+// BEFORE io.Copy returns.
+//
+// v0.1.28 (audit-1 bug #4, MEDIUM): the previous implementation stored
+// gotRemoteData AFTER io.Copy returned (i.e. when remote had already
+// closed), making the bi-directional CloseWrite branch unreachable.
+// This wrapper fixes the timing: flag is set on the first chunk of
+// data received, not on EOF.
+type trackingReader struct {
+        r    io.Reader
+        flag *atomic.Int32
+}
+
+func (t *trackingReader) Read(p []byte) (int, error) {
+        n, err := t.r.Read(p)
+        if n > 0 {
+                t.flag.Store(1)
+        }
+        return n, err
 }

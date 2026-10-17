@@ -416,8 +416,17 @@ func Spawn(cmd string, cols, rows uint16) (*PTY, error) {
 //
 // Callers in main.go use io.Copy(pty, conn) which calls pty.Write()
 // — to make that work, PTY implements io.Writer via this method.
+//
+// v0.1.28 (audit-3 bug #2, HIGH): race-safe against Close. The
+// previous version checked `p.writeFd == 0` without holding closeMu,
+// then called WriteFile. Between check and use, Close could close
+// the handle and the OS could recycle the handle value — WriteFile
+// would then write to an unrelated kernel object (handle-recycling
+// TOCTOU). Now we hold closeMu across the check + WriteFile.
 func (p *PTY) Write(b []byte) (int, error) {
-        if p.writeFd == 0 {
+        p.closeMu.Lock()
+        defer p.closeMu.Unlock()
+        if p.closed || p.writeFd == 0 {
                 return 0, fmt.Errorf("gspty: write to closed PTY")
         }
         var written uint32
@@ -431,6 +440,10 @@ func (p *PTY) Write(b []byte) (int, error) {
 // SetWindowSize resizes the ConPTY. The child process sees this as a
 // WINDOW_BUFFER_SIZE_EVENT and (if it has a SIGWINCH-equivalent handler)
 // redraws accordingly. cmd.exe / PowerShell / WSL all handle this.
+//
+// v0.1.28 (audit-3 bug #6, MEDIUM): race-safe against Close. Same
+// handle-recycling TOCTOU as Write — hPC could be closed and recycled
+// between check and ResizePseudoConsole.Call. Now holds closeMu.
 func (p *PTY) SetWindowSize(cols, rows uint16) error {
         // BUG FIX (v0.1.13): ResizePseudoConsole takes the COORD by VALUE
         // (4 bytes packed: X in low 16 bits, Y in high 16 bits), NOT by
@@ -450,6 +463,11 @@ func (p *PTY) SetWindowSize(cols, rows uint16) error {
                 // dimensions. Defensive — the caller should never send
                 // these, but if it does we don't want a confusing hr.
                 return fmt.Errorf("gspty: ResizePseudoConsole: invalid size %dx%d", cols, rows)
+        }
+        p.closeMu.Lock()
+        defer p.closeMu.Unlock()
+        if p.closed || p.hPC == 0 {
+                return fmt.Errorf("gspty: SetWindowSize on closed PTY")
         }
         packed := uintptr(uint16(int16(cols))) | (uintptr(uint16(int16(rows))) << 16)
         r, _, _ := procResizePseudoConsole.Call(uintptr(p.hPC), packed)
