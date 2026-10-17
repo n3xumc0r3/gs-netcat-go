@@ -15,7 +15,17 @@
 // All Win32 calls go through syscall (no cgo) so the binary stays
 // pure-Go and cross-compilable from Linux.
 
-//go:build windows
+//go:build windows && amd64
+
+// v0.1.29 (audit-3 LOW): constrain to amd64. The startupInfoEx struct
+// (line 614+) uses x64-specific padding ([4]byte after Cb to align
+// the next pointer field to 8 bytes). On x86 pointers are 4-byte
+// aligned and no padding is needed — the struct would be 96 bytes,
+// not 112, and the compile-time assertion `var _ [...]byte = [112]byte{}`
+// would fail with an opaque type-mismatch error. Now the build
+// constraint makes the failure explicit: 32-bit Windows builds get
+// a clean "no PTY" stub (defined in pty_windows_386.go) instead of
+// a confusing compile error.
 
 package gspty
 
@@ -248,7 +258,15 @@ func Spawn(cmd string, cols, rows uint16) (*PTY, error) {
                         // detail past the 63-byte STATUS truncation).
                         return nil, fmt.Errorf("%w: CreatePseudoConsole: %v", ErrNoPTY, err)
                 }
-                return nil, fmt.Errorf("gspty: CreatePseudoConsole failed (hr=0x%08x): %w", uint32(r), err)
+                // v0.1.29 (audit-3 LOW): drop the misleading errno wrap.
+                // LazyProc.Call returns (r, _, err) where r is the HRESULT
+                // (authoritative for COM APIs like ConPTY) and err is the
+                // Win32 GetLastError (often stale or 0 for ConPTY calls).
+                // The previous format "hr=0x%08x: <errno>" suggested the
+                // errno was related to the HRESULT, but it's a separate
+                // value. Now we report only the HRESULT (which is the
+                // authoritative error for ConPTY).
+                return nil, fmt.Errorf("gspty: CreatePseudoConsole failed (hr=0x%08x)", uint32(r))
         }
         // The pseudoconsole now owns inputRead and outputWrite; the parent
         // keeps inputWrite (to push data into the ConPTY) and outputRead
@@ -260,6 +278,17 @@ func Spawn(cmd string, cols, rows uint16) (*PTY, error) {
         // 3. Prepare the STARTUPINFOEX with the pseudoconsole attribute.
         attrListSize := uintptr(0)
         procInitializeProcThreadAttributeList.Call(0, 1, 0, uintptr(unsafe.Pointer(&attrListSize)))
+        // v0.1.29 (audit-3 LOW): defensive check. The first call is expected
+        // to fail with ERROR_INSUFFICIENT_BUFFER and write the required size
+        // to attrListSize. If for any reason attrListSize stays 0, the
+        // subsequent make() returns an empty slice and `&attrList[0]` would
+        // panic with "index out of range". Bail with a clear error instead.
+        if attrListSize == 0 {
+                procClosePseudoConsole.Call(uintptr(hPC))
+                syscall.CloseHandle(inputWrite)
+                syscall.CloseHandle(outputRead)
+                return nil, fmt.Errorf("gspty: InitializeProcThreadAttributeList size query returned 0")
+        }
         attrList := make([]byte, attrListSize)
         r, _, _ = procInitializeProcThreadAttributeList.Call(
                 uintptr(unsafe.Pointer(&attrList[0])),

@@ -459,3 +459,81 @@ Stage Summary:
 - All existing tests pass
 - All three platform builds succeed
 - End-to-end interactive session works (15/15 commands)
+
+---
+Task ID: v0.1.29-audit2
+Agent: main
+Task: Fix the remaining 12 LOW bugs deferred from v0.1.28-audit.
+
+Patches applied (12 bugs, all LOW):
+
+1. cmd/gs-netcat/test_mode.go + main.go: runTestMode returns exit code
+   instead of calling os.Exit. Was bypassing deferred f.Close() for -L
+   logfile. main() now unwraps testModeExitError and calls os.Exit after
+   defers run. (audit-1 LOW)
+
+2. cmd/gs-netcat/main.go trimNUL: now only trims CR/LF (line endings),
+   preserves spaces and tabs. Was stripping significant trailing
+   whitespace from working-directory paths and log messages. (audit-1 LOW)
+
+3. cmd/gs-netcat/main.go runInteractiveServer: removed redundant
+   pty.Close() call inside io.Copy goroutine (was 3-way Close race).
+   defer pty.Close() + remoteClosed branch already cover cleanup.
+   (audit-1 LOW)
+
+4. internal/tlssrp/handshake_messages.go finishedMsg.marshal: set all
+   3 bytes of length field (was only x[3]). Latent truncation if
+   verifyData ever exceeds 255 bytes. (audit-3 LOW)
+
+5. internal/tlssrp/handshake_client.go + handshake_server.go: check
+   writeRecord errors (9 sites). Was discarding (n, err) → original
+   I/O error masked by later confusing error. (audit-3 LOW)
+
+6. internal/tlssrp/conn.go: safe type assertion err.(alert) at 2 sites
+   (readRecord + writeRecord changeCipherSpec paths). Was unchecked →
+   latent panic if changeCipherSpec returns non-alert error.
+   (audit-3 LOW)
+
+7. internal/gspty/pty_windows.go: check InitializeProcThreadAttributeList
+   size query result. Was potential index-out-of-range panic if
+   attrListSize stayed 0. (audit-3 LOW)
+
+8. internal/tlssrp/key_agreement.go: fakepms length matches real PMS
+   length (len(N.Bytes())). Was fixed 16 bytes → ~800ns timing side-
+   channel between "user exists" and "user doesn't exist" paths.
+   (audit-3 LOW)
+
+9. internal/gspty/pty_windows.go CreatePseudoConsole: drop misleading
+   errno wrap. Was "hr=0x...: <errno>" suggesting errno related to
+   HRESULT (it's a separate GetLastError value, often stale/0).
+   (audit-3 LOW)
+
+10. internal/gspty/pty_windows.go + termios_windows.go: add //go:build
+    windows && amd64 constraint. New pty_windows_386.go + termios_windows_386.go
+    stubs return ErrNoPTY + no-op SavedTermios for 32-bit Windows builds.
+    Was: opaque compile error on x86 due to x64-specific struct padding.
+    (audit-3 LOW)
+
+11. internal/tlssrp/key_agreement.go processServerKeyExchange: validate
+    group FIRST, then check B mod N != 0. Was reversed — malicious N=1
+    would return wrong alert (alertIllegalParameter instead of
+    alertInsufficientSecurity). Per RFC 5054 group is validated first.
+    (audit-3 LOW)
+
+12. internal/gsids/manager.go: corrected package doc. Was falsely
+    claiming sendLog is called under mu + WriteMsg is non-blocking.
+    Actual code: mu released before broadcast loop, WriteMsg is
+    blocking. Doc now matches reality. (audit-4 LOW)
+
+Build verification:
+- go build ./...: clean on Linux amd64, Linux arm64, Windows amd64,
+  Windows 386 (NEW — previously failed with opaque error)
+- go test -race ./...: all packages pass
+- End-to-end stress test: Go-server + Go-client, 15 commands with 2s
+  pauses — ALL succeeded, zero hangs
+
+Stage Summary:
+- 12 LOW bugs fixed in this pass
+- Combined with v0.1.28-audit (24 bugs): 36 of 41 audit bugs total fixed
+- 5 remaining bugs are pure doc-comment / cosmetic — no behavioral impact
+- Codebase now compiles on 4 platforms (was 3)

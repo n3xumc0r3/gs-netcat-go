@@ -14,7 +14,11 @@
 // between the screen buffer (which can be larger than the window)
 // and the window, but the C original uses the visible terminal size.
 
-//go:build windows
+//go:build windows && amd64
+
+// v0.1.29: same constraint as pty_windows.go — the API constants
+// (ENABLE_*) and proc* variables are defined there, so this file
+// can only compile alongside pty_windows.go (which is amd64-only).
 
 package gspty
 

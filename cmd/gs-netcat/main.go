@@ -130,9 +130,27 @@ func main() {
                 os.Setenv("GSPORT_DEBUG", "1")
         }
         if err := run(args); err != nil {
+                // v0.1.29: testModeExitError carries a process exit code from
+                // runTestMode without going through os.Exit inside run()
+                // (which would skip deferred cleanup like -L logfile Close).
+                if tmee, ok := err.(testModeExitError); ok {
+                        os.Exit(tmee.code)
+                }
                 fmt.Fprintln(os.Stderr, "gs-netcat:", err)
                 os.Exit(1)
         }
+}
+
+// testModeExitError wraps an exit code from runTestMode so the main()
+// caller can perform os.Exit AFTER run() returns (allowing deferred
+// cleanup functions like logfile Close to run). Returned by run()
+// when -t mode is used; main() unwraps it and calls os.Exit(code).
+type testModeExitError struct {
+        code int
+}
+
+func (e testModeExitError) Error() string {
+        return fmt.Sprintf("gs-netcat: -t exit code %d", e.code)
 }
 
 func run(args []string) error {
@@ -219,7 +237,7 @@ Example for an interactive session:
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.28-audit"
+        const defaultVersion = "v0.1.29-audit2"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -397,7 +415,9 @@ Example for an interactive session:
         }
 
         // -t: test mode (no data path, no secret prompt, just probe the
-        // relay). We exit from inside runTestMode.
+        // relay). v0.1.29: runTestMode now returns an exit code instead of
+        // calling os.Exit, so deferred cleanup (e.g. -L logfile Close)
+        // runs before the process exits.
         if flagTest {
                 if listen {
                         // -t is a client-only feature in the C original
@@ -406,7 +426,7 @@ Example for an interactive session:
                         // -l to avoid confusing the user.
                         fmt.Fprintf(os.Stderr, "[gs-netcat] -t is a client-only flag; ignoring -l\n")
                 }
-                return runTestMode(secret, relayHost, relayPort, verbose)
+                return testModeExitError{code: runTestMode(secret, relayHost, relayPort, verbose)}
         }
 
         // -D and/or -W: daemon/watchdog dispatch. This re-execs the
@@ -793,9 +813,18 @@ func runInteractiveServer(conn *gsconn.Conn, ctx *eventCtx, verbose bool, remote
         // of pty.Master so the same code works on Windows (where the
         // master end is read-only and writes go through a separate
         // input pipe).
+        // v0.1.29 (audit-1 LOW): removed the redundant pty.Close() at the
+        // end of this io.Copy goroutine. The defer pty.Close() at line 799
+        // AND the explicit pty.Close() in the remoteClosed branch (line ~841)
+        // already cover cleanup. PTY.Close is now idempotent (v0.1.28 added
+        // the `closed` flag), so the extra call was harmless but wasteful
+        // (3x Close per session = 3x SIGTERM + 3x async-wait goroutine).
         go func() {
                 _, _ = io.Copy(pty, conn) // conn -> shell stdin (via PTY.Write)
-                pty.Close()               // closing master makes shell see EOF
+                // Don't close pty here — closing master makes shell see EOF,
+                // but the defer at line 799 + the remoteClosed branch below
+                // already handle this. Closing here caused a 3-way race with
+                // those other two close sites.
         }()
         go func() {
                 n, _ := io.Copy(conn, pty.Master) // shell stdout -> conn
@@ -1357,7 +1386,14 @@ func handleChannel(conn *gsconn.Conn, ctx *eventCtx, ev gspkt.Event, verbose boo
 // Kept here only as a reference; trimNUL is the only generic helper.
 
 // trimNUL returns b truncated at the first NUL byte (if any), with
-// trailing whitespace trimmed.
+// trailing CR/LF line endings trimmed.
+//
+// v0.1.29 (audit-1 LOW): previously trimmed ALL trailing whitespace
+// (space, tab, CR, LF). This silently corrupted working-directory
+// paths that legitimately end in a space (e.g. `/home/user/project `)
+// and log/status messages where trailing spaces may be significant.
+// Now we only trim CR/LF (line endings) which is the actual noise
+// from PTY echo; spaces and tabs are preserved.
 func trimNUL(b []byte) []byte {
         for i, c := range b {
                 if c == 0 {
@@ -1365,8 +1401,9 @@ func trimNUL(b []byte) []byte {
                         break
                 }
         }
-        // trim trailing whitespace
-        for len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\n' || b[len(b)-1] == '\r' || b[len(b)-1] == '\t') {
+        // trim only trailing CR/LF (line endings from PTY echo);
+        // preserve spaces and tabs (they may be significant).
+        for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
                 b = b[:len(b)-1]
         }
         return b

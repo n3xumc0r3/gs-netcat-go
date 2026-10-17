@@ -29,12 +29,12 @@
 //   - On non-Linux platforms UtmpEntries returns no entries, so
 //     tick() is effectively a no-op.
 //
-// Thread safety: Manager.mu guards subs and udb. The ticker holds
-// mu for the entire tick() to ensure atomic snapshot-vs-broadcast.
-// Subscribe/unsubscribe also acquire mu. The sendLog conn.WriteMsg
-// is called under mu — this is fine because WriteMsg is non-blocking
-// (it just enqueues to the TLS write buffer) and a slow client would
-// block the IDS tick but not the rest of the server.
+// Thread safety (v0.1.29 corrected): Manager.mu guards subs and udb.
+// tick() acquires mu only for events() and the subscriber snapshot,
+// then releases mu before broadcasting. sendLog/WriteMsg is called
+// WITHOUT mu; WriteMsg may block on a slow client's TLS write buffer,
+// but this blocks only the tick goroutine (other subscribers and the
+// rest of the server are unaffected).
 package gsids
 
 import (

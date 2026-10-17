@@ -594,7 +594,14 @@ Again:
                 }
                 err := c.in.changeCipherSpec()
                 if err != nil {
-                        c.sendAlert(err.(alert))
+                        // v0.1.29 (audit-3 LOW): safe type assertion. Was unchecked
+                        // `err.(alert)` which panics if a future change returns a
+                        // non-alert error from changeCipherSpec.
+                        if a, ok := err.(alert); ok {
+                                c.sendAlert(a)
+                        } else {
+                                c.sendAlert(alertInternalError)
+                        }
                 }
 
         case recordTypeApplicationData:
@@ -718,8 +725,13 @@ func (c *Conn) writeRecord(typ recordType, data []byte) (n int, err error) {
                 if err != nil {
                         // Cannot call sendAlert directly,
                         // because we already hold c.out.Mutex.
+                        // v0.1.29 (audit-3 LOW): safe type assertion (was unchecked).
+                        alertVal := alertInternalError
+                        if a, ok := err.(alert); ok {
+                                alertVal = a
+                        }
                         c.tmp[0] = alertLevelError
-                        c.tmp[1] = byte(err.(alert))
+                        c.tmp[1] = byte(alertVal)
                         c.writeRecord(recordTypeAlert, c.tmp[0:2])
                         return n, c.setError(&net.OpError{Op: "local error", Err: err})
                 }

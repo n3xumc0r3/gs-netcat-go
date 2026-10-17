@@ -76,7 +76,17 @@ func (ka *srpKeyAgreement) processClientKeyExchange(config *Config, ckx *clientK
         }
 
         // always create the fake pms
-        fakepms := make([]byte, 16)
+        // v0.1.29 (audit-3 LOW): size fakepms to match the real PMS length.
+        // For SRP-4096 the real PMS is up to 512 bytes; HMAC-SHA256 hashes
+        // keys > 64 bytes (8 extra SHA-256 blocks for 512 bytes). A fixed
+        // 16-byte fakepms would create a ~800ns timing side-channel between
+        // "user exists" and "user doesn't exist" paths. Now both paths use
+        // the same PMS length.
+        fakepmsLen := len(ka.N.Bytes())
+        if fakepmsLen < 16 {
+                fakepmsLen = 16 // defensive floor
+        }
+        fakepms := make([]byte, fakepmsLen)
         _, err := io.ReadFull(config.rand(), fakepms)
         if err != nil {
                 return nil, err
@@ -103,12 +113,19 @@ func (ka *srpKeyAgreement) processServerKeyExchange(config *Config, clientHello 
         s := skx.s
         ka.B = new(big.Int).SetBytes(skx.B)
 
-        if new(big.Int).Rem(ka.B, ka.N).Sign() == 0 {
-                return alert(alertIllegalParameter)
-        }
-
+        // v0.1.29 (audit-3 LOW): validate group FIRST, then check B mod N.
+        // Previously B mod N was checked first using unvalidated N — a
+        // malicious server sending N=1 would make Rem(B, 1) == 0 and
+        // return alertIllegalParameter instead of alertInsufficientSecurity
+        // (wrong alert for invalid group). Worse, N=0 could panic in Rem
+        // before group validation. Per RFC 5054 the group is validated
+        // first, then B is checked.
         if !srpValidGroup(config, ka.N, ka.g) {
                 return alert(alertInsufficientSecurity)
+        }
+
+        if new(big.Int).Rem(ka.B, ka.N).Sign() == 0 {
+                return alert(alertIllegalParameter)
         }
 
         // rfc suggests "at least 256 bits, for 128-bits security"
