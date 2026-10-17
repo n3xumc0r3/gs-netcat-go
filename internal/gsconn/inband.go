@@ -4,6 +4,7 @@ import (
         "encoding/binary"
         "fmt"
         "os"
+        "time"
 
         "github.com/gsport/gs-netcat/internal/gspkt"
 )
@@ -55,6 +56,17 @@ func hexdump(b []byte) string {
         return string(out)
 }
 
+// tslog returns a timestamped stderr prefix for debug logging.
+// v0.1.25: timestamps are critical for diagnosing timing-related hangs
+// (e.g. "did the PING fire right before bash stopped responding?").
+func tslog(format string, args ...interface{}) {
+        if os.Getenv("GSPORT_DEBUG") == "" {
+                return
+        }
+        prefix := time.Now().Format("15:04:05.000 ")
+        fmt.Fprintf(os.Stderr, prefix+format+"\n", args...)
+}
+
 // inBandRead is the in-band-aware Read path. It is called from Conn.Read
 // when c.ib != nil. It returns decoded application-data bytes from
 // dataBuf, refilling dataBuf (and the events channel) from the
@@ -72,7 +84,6 @@ func (c *Conn) inBandRead(p []byte) (int, error) {
         defer c.pktMu.Unlock()
 
         ib := c.ib
-        debug := os.Getenv("GSPORT_DEBUG") != ""
         for {
                 if ib.proto != nil {
                         return 0, ib.proto
@@ -81,17 +92,15 @@ func (c *Conn) inBandRead(p []byte) (int, error) {
                 if len(ib.dataBuf) > 0 {
                         n := copy(p, ib.dataBuf)
                         ib.dataBuf = ib.dataBuf[n:]
-                        if debug {
-                                fmt.Fprintf(os.Stderr, "[gsport] READ app-data: %d bytes (drained from buf): %s\n",
-                                        n, hexdump(p[:n]))
-                        }
+                        tslog("[gsport] READ app-data: %d bytes (drained from buf): %s",
+                                n, hexdump(p[:n]))
                         return n, nil
                 }
                 // Need more bytes from the wire.
                 raw := make([]byte, 4096)
                 n, err := c.rawConn.Read(raw)
-                if debug && n > 0 {
-                        fmt.Fprintf(os.Stderr, "[gsport] WIRE-IN raw: %d bytes: %s\n", n, hexdump(raw[:n]))
+                if n > 0 {
+                        tslog("[gsport] WIRE-IN raw: %d bytes: %s", n, hexdump(raw[:n]))
                 }
                 if n > 0 {
                         out := make([]byte, n*2) // worst case: every byte is ESC, doubled
@@ -99,16 +108,14 @@ func (c *Conn) inBandRead(p []byte) (int, error) {
                         _, written, derr := ib.dec.Decode(raw[:n], out, &events)
                         if derr != nil {
                                 ib.proto = derr
-                                fmt.Fprintf(os.Stderr, "[gsport] READ decode error: %v (raw was: %s)\n",
+                                tslog("[gsport] READ decode error: %v (raw was: %s)",
                                         derr, hexdump(raw[:n]))
                                 return 0, fmt.Errorf("gsconn: in-band decode: %w", derr)
                         }
                         if written > 0 {
                                 ib.dataBuf = append(ib.dataBuf, out[:written]...)
-                                if debug {
-                                        fmt.Fprintf(os.Stderr, "[gsport] READ decoded: %d bytes data + %d events\n",
-                                                written, len(events))
-                                }
+                                tslog("[gsport] READ decoded: %d bytes data + %d events",
+                                        written, len(events))
                         }
                         // Push events to channel. Non-blocking: drop with warning if full.
                         for _, ev := range events {
@@ -116,28 +123,20 @@ func (c *Conn) inBandRead(p []byte) (int, error) {
                                 // (under pktMu, which we hold). Check the flag
                                 // before sending to avoid a panic on send-to-closed.
                                 if ib.eventsClosed {
-                                        if debug {
-                                                fmt.Fprintf(os.Stderr, "[gsport] in-band: events channel closed, dropping %+v\n", ev)
-                                        }
+                                        tslog("[gsport] in-band: events channel closed, dropping %+v", ev)
                                         continue
                                 }
-                                if debug {
-                                        fmt.Fprintf(os.Stderr, "[gsport] EVENT: kind=%v type=%d raw=%d data(%d): %s\n",
-                                                ev.Kind, ev.Type, ev.Raw, len(ev.Data), hexdump(ev.Data))
-                                }
+                                tslog("[gsport] EVENT: kind=%v type=%d raw=%d data(%d): %s",
+                                        ev.Kind, ev.Type, ev.Raw, len(ev.Data), hexdump(ev.Data))
                                 select {
                                 case ib.events <- ev:
                                 default:
-                                        if debug {
-                                                fmt.Fprintf(os.Stderr, "[gsport] in-band: event channel full, dropping %+v\n", ev)
-                                        }
+                                        tslog("[gsport] in-band: event channel full, dropping %+v", ev)
                                 }
                         }
                 }
                 if err != nil {
-                        if debug {
-                                fmt.Fprintf(os.Stderr, "[gsport] READ err: %v (dataBuf=%d)\n", err, len(ib.dataBuf))
-                        }
+                        tslog("[gsport] READ err: %v (dataBuf=%d)", err, len(ib.dataBuf))
                         if len(ib.dataBuf) > 0 {
                                 continue
                         }
@@ -152,14 +151,10 @@ func (c *Conn) inBandRead(p []byte) (int, error) {
 // — this matches io.Writer semantics.
 func (c *Conn) inBandWrite(p []byte) (int, error) {
         enc := gspkt.EncodeDataAlloc(p)
-        if os.Getenv("GSPORT_DEBUG") != "" {
-                fmt.Fprintf(os.Stderr, "[gsport] WRITE app-data: %d bytes raw=%s encoded=%d bytes: %s\n",
-                        len(p), hexdump(p), len(enc), hexdump(enc))
-        }
+        tslog("[gsport] WRITE app-data: %d bytes raw=%s encoded=%d bytes: %s",
+                len(p), hexdump(p), len(enc), hexdump(enc))
         if _, err := c.rawConn.Write(enc); err != nil {
-                if os.Getenv("GSPORT_DEBUG") != "" {
-                        fmt.Fprintf(os.Stderr, "[gsport] WRITE err: %v\n", err)
-                }
+                tslog("[gsport] WRITE err: %v", err)
                 return 0, err
         }
         return len(p), nil
@@ -179,13 +174,26 @@ func (c *Conn) WriteMsg(t uint8, payload []byte) error {
         if err != nil {
                 return err
         }
-        if os.Getenv("GSPORT_DEBUG") != "" {
-                fmt.Fprintf(os.Stderr, "[gsport] WRITE-MSG type=%d len=%d: %s\n",
-                        t, len(wire), hexdump(wire))
+        // Map common message types to names for easier log reading.
+        typeName := fmt.Sprintf("type=%d", t)
+        switch t {
+        case gspkt.MsgWSIZE:
+                typeName = "WSIZE"
+        case gspkt.MsgIDS:
+                typeName = "IDS"
+        case gspkt.MsgPWD:
+                typeName = "PWD"
+        case gspkt.MsgPING: // == MsgPONG == 16 (same wire type, distinguished by role)
+                typeName = "PING/PONG"
+        case gspkt.MsgLOG:
+                typeName = "LOG"
+        case gspkt.MsgSTATUS:
+                typeName = "STATUS"
         }
+        tslog("[gsport] WRITE-MSG %s len=%d: %s", typeName, len(wire), hexdump(wire))
         _, err = c.rawConn.Write(wire)
-        if err != nil && os.Getenv("GSPORT_DEBUG") != "" {
-                fmt.Fprintf(os.Stderr, "[gsport] WRITE-MSG err: %v\n", err)
+        if err != nil {
+                tslog("[gsport] WRITE-MSG %s err: %v", typeName, err)
         }
         return err
 }

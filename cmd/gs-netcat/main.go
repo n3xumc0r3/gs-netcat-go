@@ -219,7 +219,7 @@ Example for an interactive session:
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.24-debug"
+        const defaultVersion = "v0.1.25-debug"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -910,14 +910,16 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
         go func() {
                 n, _ := io.Copy(conn, os.Stdin)
                 if os.Getenv("GSPORT_DEBUG") != "" {
-                        fmt.Fprintf(os.Stderr, "[gsport] stdin->conn io.Copy returned: n=%d\n", n)
+                        fmt.Fprintf(os.Stderr, "%s [gsport] stdin->conn io.Copy returned: n=%d\n",
+                                time.Now().Format("15:04:05.000"), n)
                 }
                 close(stdinDone)
         }()
         go func() {
                 n, err := io.Copy(os.Stdout, conn)
                 if os.Getenv("GSPORT_DEBUG") != "" {
-                        fmt.Fprintf(os.Stderr, "[gsport] conn->stdout io.Copy returned: n=%d err=%v\n", n, err)
+                        fmt.Fprintf(os.Stderr, "%s [gsport] conn->stdout io.Copy returned: n=%d err=%v\n",
+                                time.Now().Format("15:04:05.000"), n, err)
                 }
                 close(remoteClosed)
         }()

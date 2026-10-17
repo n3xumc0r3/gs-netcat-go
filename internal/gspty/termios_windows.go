@@ -155,6 +155,7 @@ func SetRawStdin() (*SavedTermios, error) {
         newMode &^= ENABLE_PROCESSED_INPUT      // turn off Ctrl-C / Ctrl-S signal generation
         newMode &^= ENABLE_QUICK_EDIT_MODE      // turn off QuickEdit (prevents I/O freeze on mouse click)
         newMode &^= ENABLE_INSERT_MODE          // turn off Insert mode (don't confuse remote readline)
+        newMode &^= ENABLE_MOUSE_INPUT          // v0.1.25: turn off mouse input — with VT input mode ON, Windows Terminal translates mouse clicks into SGR escape sequences (\x1b[<35;33;16M) which flood the remote readline and corrupt its state
         newMode |= ENABLE_VIRTUAL_TERMINAL_INPUT // VT input passthrough
 
         r, _, err = procSetConsoleMode.Call(uintptr(fd), uintptr(newMode))
