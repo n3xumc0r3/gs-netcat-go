@@ -209,3 +209,33 @@ Build verification:
 Stage Summary:
 - This should fix the "lost character" symptom.
 - If characters are still being lost, the next suspect is Go's Windows console input reader (known issue golang/go#12053).
+
+---
+Task ID: v0.1.23-debug
+Agent: external-audit
+Task: User reported v0.1.22-fix still doesn't work — first ls works, second ls causes client to exit (back to PowerShell). User is frustrated, asked me to stop guessing.
+
+Action: STOP GUESSING. Add full byte-level telemetry under GSPORT_DEBUG (which -vvv enables).
+
+What was added:
+- internal/gsconn/inband.go inBandRead: log every raw byte received from wire (hexdump), every decoded app-data chunk, every in-band event with kind/type/raw/data hexdump, every decode error
+- internal/gsconn/inband.go inBandWrite: log every byte being written (raw + encoded hexdump)
+- internal/gsconn/inband.go WriteMsg: log every in-band message write (type, length, hexdump)
+- cmd/gs-netcat/main.go runInteractiveClient: log when stdin->conn and conn->stdout io.Copy goroutines return (with n and err)
+
+This will let us see EXACTLY:
+1. What bytes the user typed (from stdin->conn WRITE log)
+2. What bytes the server sent back (from WIRE-IN log)
+3. What in-band events the server sent (EVENT log with type)
+4. What caused the disconnect (which io.Copy returned first, with what error)
+
+Without this log, I was guessing. With it, we can see the actual sequence.
+
+Build:
+- go build ./...: clean
+- go test -race ./...: passes
+- Built download/gs-netcat-v0.1.23-debug.exe
+
+User should run:
+  .\gs-netcat.exe -i -vvv -s <secret> 2> log.txt
+...reproduce the freeze, then send log.txt
