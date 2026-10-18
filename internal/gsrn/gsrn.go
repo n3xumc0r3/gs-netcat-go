@@ -380,6 +380,12 @@ type Options struct {
         // receives the host and port as separate strings and returns a
         // connected net.Conn (or an error).
         Dialer func(host, port string) (net.Conn, error)
+
+        // v0.3.2: Resolver, if non-nil, resolves the relay hostname
+        // via a custom resolver (e.g. DNS-over-HTTPS) instead of the
+        // system DNS. The function receives the hostname and returns
+        // an IP address string (or an error).
+        Resolver func(host string) (string, error)
 }
 
 // DefaultOptions returns sensible defaults for connecting to a relay.
@@ -447,11 +453,23 @@ func Dial(addr [16]byte, listen bool, opts *Options) (*Conn, error) {
         // v0.1.30: If a SOCKS5 proxy dialer is configured (e.g. --tor),
         // use it instead of the direct net.DialTimeout. The Dialer field
         // is set by the caller via opts.Dialer. nil = direct dial.
-        target := net.JoinHostPort(opts.RelayHost, fmt.Sprintf("%d", opts.RelayPort))
+        //
+        // v0.3.2: If opts.Resolver is set, resolve the relay hostname via
+        // the custom resolver (e.g. DoH) before dialing. This bypasses
+        // system DNS.
+        relayHost := opts.RelayHost
+        if opts.Resolver != nil {
+                resolved, rerr := opts.Resolver(opts.RelayHost)
+                if rerr != nil {
+                        return nil, fmt.Errorf("gsrn: resolve relay %s: %w", opts.RelayHost, rerr)
+                }
+                relayHost = resolved
+        }
+        target := net.JoinHostPort(relayHost, fmt.Sprintf("%d", opts.RelayPort))
         var tcpConn net.Conn
         var err error
         if opts.Dialer != nil {
-                tcpConn, err = opts.Dialer(opts.RelayHost, fmt.Sprintf("%d", opts.RelayPort))
+                tcpConn, err = opts.Dialer(relayHost, fmt.Sprintf("%d", opts.RelayPort))
                 if err != nil {
                         return nil, fmt.Errorf("gsrn: dial relay via proxy: %w", err)
                 }

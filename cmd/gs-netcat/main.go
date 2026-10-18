@@ -219,6 +219,11 @@ func run(args []string) error {
   v0.1.30 — Stealth (Go-Go only — C peer will not understand):
   --compress zstd|gzip  Compress data stream [G<->G only]
   --stealth-https       Wrap GSRN packets in fake TLS records (bypass port-443 DPI) [G<->G only]
+  --tls-fingerprint <p> Use browser ClientHello profile (chrome|firefox|safari|edge). Requires --stealth-https [G<->G]
+  --tls-fingerprint-real <p> Use REAL utls ClientHello (chrome|firefox|safari|edge|ios|android|random) [G<->G]
+
+  v0.3.2 — DNS bypass:
+  --doh <provider>       DNS-over-HTTPS resolver: cloudflare|google|quad9|opendns|adguard|<URL> [--]
 
 Compatibility shorthand used above:
   [G<->C]   = works Go-client <-> C-server AND C-client <-> Go-server
@@ -301,13 +306,14 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 flagTLSFingerprint string // --tls-fingerprint <profile>
                 flagTLSFingerprintReal string // --tls-fingerprint-real <profile>
                 flagConcurrentPeers int    // --concurrent-peers N
+                flagDoH            string // --doh
         )
 
         // Version is injected at build time via -ldflags. The default value
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.3.0-feat"
+        const defaultVersion = "v0.3.2-feat"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -375,6 +381,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         fs.StringVar(&flagTLSFingerprint, "tls-fingerprint", "", "Use pre-recorded browser ClientHello profile (chrome|firefox|safari|edge). Requires --stealth-https. [G↔G]")
         fs.StringVar(&flagTLSFingerprintReal, "tls-fingerprint-real", "", "Use REAL utls ClientHello (chrome|firefox|safari|edge|ios|android|random). Requires --stealth-https. [G↔G]")
         fs.IntVar(&flagConcurrentPeers, "concurrent-peers", 0, "Max simultaneous concurrent peers in -l -i mode (0=sequential, default; N=true parallelism) [--]")
+        fs.StringVar(&flagDoH, "doh", "", "DNS-over-HTTPS resolver: cloudflare|google|quad9|opendns|adguard|<URL> [--]")
 
         if err := fs.Parse(args); err != nil {
                 // -h / --help / -help / --h: Go's flag package has
@@ -556,6 +563,20 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 }
         }
 
+        // v0.3.2: --doh. Set the DoH resolver so relay hostnames are resolved
+        // via DNS-over-HTTPS instead of system DNS. Bypasses DNS-level blocking.
+        if flagDoH != "" {
+                dohProvider = flagDoH
+                if _, ok := dohProviders[strings.ToLower(flagDoH)]; !ok {
+                        if !strings.HasPrefix(flagDoH, "http://") && !strings.HasPrefix(flagDoH, "https://") {
+                                return fmt.Errorf("--doh: %q is not a known provider (cloudflare|google|quad9|opendns|adguard) or a URL (https://...)", flagDoH)
+                        }
+                }
+                if verbose {
+                        logf("doh: resolving relay hostname via %s", flagDoH)
+                }
+        }
+
         // v0.1.30: --ipv6. Hint to the dialer to prefer AAAA records.
         if flagIPv6 {
                 ipv6Preferred = true
@@ -646,6 +667,13 @@ Example SOCKS5 server (tunnel all local apps through remote):
         opts.NoEncryption = flagNoEnc
         if pingIntSec > 0 {
                 opts.PingInterval = time.Duration(pingIntSec) * time.Second
+        }
+
+        // v0.3.2: --doh. Install DoH resolver in opts.
+        if flagDoH != "" {
+                opts.Resolver = func(host string) (string, error) {
+                        return resolveHostname(host)
+                }
         }
 
         // v0.1.30: Dispatch to proxy server (socks5 / http) if requested.
