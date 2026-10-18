@@ -321,7 +321,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         fs.BoolVar(&receiveOnly, "r", false, "Receive-only: do not close conn on stdin EOF; wait for remote to close")
         fs.StringVar(&logFile, "L", "", "Append log output to file (in addition to stderr)")
         fs.BoolVar(&showMan, "m", false, "Print man page and exit")
-        fs.BoolVar(&flagSOCKS, "S", false, "Act as a SOCKS server [needs -l] (NOT YET IMPLEMENTED in the Go port)")
+        fs.BoolVar(&flagSOCKS, "S", false, "Act as a SOCKS server (alias for --socks5)")
         fs.BoolVar(&flagTest, "t", false, "Test if peer is listening (CONNECT mode). Prints '<secret> <addr> OK|NO|NET-ERROR' and exits.")
         fs.BoolVar(&flagDaemon, "D", false, "Daemonize: detach from terminal and run in background. Use with -L to keep a log.")
         fs.BoolVar(&flagWatch, "W", false, "Watchdog: supervise and auto-restart on crash. Combine with -D for detached supervision.")
@@ -428,13 +428,11 @@ Example SOCKS5 server (tunnel all local apps through remote):
 
         // v0.1.30: -S now aliases --socks5 (implemented; was a stub before).
         // The --socks5 / --http-proxy flags dispatch to runProxyServer
-        // which handles both protocols. Requires -l -p PORT.
-        // NOTE: Actual dispatch happens AFTER opts is built (see below
-        // ~line 630). This block is just the validation/usage check.
-        if flagSOCKS || flagHTTPProxy {
-                if !listen {
-                        return fmt.Errorf("-S / --socks5 / --http-proxy requires -l (listen mode)")
-                }
+        // which handles both protocols. Requires -p PORT.
+        // NOTE: These modes do NOT require -l — the local proxy server
+        // itself is the listener, and for each incoming proxy connection
+        // it opens a fresh GS client connection to the remote peer.
+        if flagSOCKS || flagSOCKS5 || flagHTTPProxy {
                 if flagPort == 0 {
                         return fmt.Errorf("-S / --socks5 / --http-proxy requires -p <port> to listen on")
                 }
@@ -575,6 +573,11 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // actual work. The parent either exits (-D) or supervises
         // (-W). This call returns ONLY in the child process.
         //
+        // v0.1.30: --watch + -D / -W incompatibility check. Done EARLY
+        // (before -D auto-imply -W) so we catch the conflict correctly.
+        if flagWatchFg && (flagDaemon || flagWatch) {
+                return fmt.Errorf("--watch is incompatible with -D / -W (use one or the other)")
+        }
         // v0.1.30 (P2 fix): In C gs-netcat, GS_daemonize() ALWAYS includes
         // a built-in watchdog loop (while(1) { fork; wait; restart }).
         // The Go port exposed -D and -W as separate flags, which broke
@@ -629,7 +632,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // v0.1.30: Dispatch to proxy server (socks5 / http) if requested.
         // This needs to happen AFTER opts is built because runProxyServer
         // uses opts to dial the remote peer.
-        if flagSOCKS || flagHTTPProxy {
+        if flagSOCKS || flagSOCKS5 || flagHTTPProxy {
                 proto := "socks5"
                 if flagHTTPProxy {
                         proto = "http"
@@ -791,12 +794,8 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // session loop in a retry loop with exponential backoff. The
         // --retry flag caps the number of attempts.
         //
-        // --watch is INCOMPATIBLE with -D / -W (which use the daemonize
-        // path). For detached persistent sessions, use -D -W. For
-        // foreground persistent sessions, use --watch.
-        if flagWatchFg && (flagDaemon || flagWatch) {
-                return fmt.Errorf("--watch is incompatible with -D / -W (use one or the other)")
-        }
+        // --watch incompatibility with -D / -W is checked earlier
+        // (before -D auto-imply -W) to catch it correctly.
         if flagWatchFg {
                 return runWatchLoop(secret, mode, opts, relayHost, relayPort,
                         userPickedRelay, verbose, flagRetry, listen,
@@ -978,10 +977,24 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 close(stdinDone)
         }()
         go func() {
-                n, _ := io.Copy(os.Stdout, connReader)
+                // v0.1.30: -o / --output. If set, write to file instead of
+                // stdout. Otherwise stdout.
+                n, _ := io.Copy(outWriter, connReader)
                 totalRead.Store(n)
                 close(remoteClosed)
         }()
+
+        // v0.1.30: --progress. Launch progress goroutine in raw cat-mode.
+        // Skipped if not requested or if interactive mode (handled separately).
+        var stopProgress func()
+        if flagProgress && !interactive {
+                stopProgress = startProgressBar(&totalWritten, &totalRead, 0)
+                defer func() {
+                        if stopProgress != nil {
+                                stopProgress()
+                        }
+                }()
+        }
 
         if receiveOnly {
                 // -r: pure receive. Ignore stdin EOF entirely.
