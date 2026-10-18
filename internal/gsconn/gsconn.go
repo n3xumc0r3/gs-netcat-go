@@ -163,6 +163,12 @@ func DefaultOptions(host string, port int) *Options {
 // gspkt in-band multiplexing protocol: data Writes are escape-encoded,
 // data Reads are decoded (with in-band events extracted to Events()).
 // Use WriteMsg/WriteChn to send in-band signalling packets.
+//
+// v0.2.0: WrapRawConn allows external code to wrap the underlying
+// io.ReadWriteCloser (e.g. with compression, rate-limiting, audit
+// logging). All subsequent Read/Write/WriteMsg operations go through
+// the wrapper. Wrappers MUST be installed before any I/O occurs
+// (typically immediately after Dial returns).
 type Conn struct {
         // rawConn is the underlying data channel: either *tlssrp.Conn
         // (encrypted mode) or net.Conn (NoEncryption / -C mode). It is
@@ -250,6 +256,52 @@ func (c *Conn) Role() gsrn.Role { return c.role }
 
 // Mode returns the local Mode (listen or connect).
 func (c *Conn) Mode() Mode { return c.mode }
+
+// WrapRawConn (v0.2.0) replaces the underlying io.ReadWriteCloser with
+// the provided wrapper. The wrapper must satisfy io.ReadWriteCloser and
+// should typically delegate Read/Write/Close to the original conn it
+// received. SetDeadline/SetReadDeadline/SetWriteDeadline/CloseWrite
+// will continue to work via type assertions on the wrapper (so the
+// wrapper should preserve those methods if it wants them to keep
+// working).
+//
+// Use this to install compression, rate-limiting, audit-logging, etc.
+// The wrapper takes effect immediately for all subsequent Read/Write
+// calls (including in-band mode).
+//
+// MUST be called BEFORE any I/O occurs on the conn (typically right
+// after Dial returns). Calling it after I/O has started is undefined.
+//
+// Example:
+//
+//   conn, _ := gsconn.Dial(...)
+//   if rateLimit > 0 {
+//       conn.WrapRawConn(newRateLimitedConn(conn.RawConn(), rateLimit))
+//   }
+//
+// Safe for one-time use. Not safe to call concurrently with Read/Write.
+func (c *Conn) WrapRawConn(wrapper io.ReadWriteCloser) {
+        if wrapper == nil {
+                return
+        }
+        c.pktMu.Lock()
+        c.rawConn = wrapper
+        c.pktMu.Unlock()
+}
+
+// RawConn (v0.2.0) returns the current underlying io.ReadWriteCloser.
+// Useful when constructing a wrapper: the wrapper typically delegates
+// to the original conn, which it captures by calling RawConn BEFORE
+// calling WrapRawConn.
+//
+// NOTE: Returns the CURRENT rawConn. After WrapRawConn, subsequent
+// calls return the wrapper. This is intentional — chained wrappers
+// (compress over rate-limit over audit, etc.) build up naturally.
+func (c *Conn) RawConn() io.ReadWriteCloser {
+        c.pktMu.Lock()
+        defer c.pktMu.Unlock()
+        return c.rawConn
+}
 
 // MarkPongReceived updates the last-PONG-received timestamp used by
 // inBandPinger's dead-server detection. The event-pump SHOULD call

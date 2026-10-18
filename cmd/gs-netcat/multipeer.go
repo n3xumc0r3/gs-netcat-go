@@ -47,7 +47,27 @@ import (
 // passed through to the per-connection handler.
 //
 // The loop terminates only on fatal error or signal.
-func runMultiPeerInteractiveServer(firstConn *gsconn.Conn, secret, relayHost string, relayPort int, opts *gsconn.Options, verbose bool, execCmd string) error {
+// runMultiPeerInteractiveServer loops forever, accepting GS
+// connections one at a time. Each connection runs the interactive
+// server flow (PTY spawn, event-pump, etc.). After a connection ends
+// we re-register with the GSRN and wait for the next.
+//
+// The FIRST connection (already established by main() before calling
+// us) is passed in as `firstConn`. We handle it inline so we don't
+// waste the already-completed TLS handshake. After it ends we close it
+// and re-dial for subsequent peers.
+//
+// `secret`, `relayHost`, `relayPort`, `opts` configure the GSRN
+// re-dial (same as the single-shot path). `verbose`, `execCmd` are
+// passed through to the per-connection handler.
+//
+// v0.2.0: maxPeers parameter limits how many peers the server will
+// accept before exiting. 0 = unlimited (default, matches v0.1.x behavior).
+// Used for --max-peers N to prevent resource exhaustion DoS.
+//
+// The loop terminates only on fatal error, signal, or when maxPeers is
+// reached (whichever comes first).
+func runMultiPeerInteractiveServer(firstConn *gsconn.Conn, secret, relayHost string, relayPort int, opts *gsconn.Options, verbose bool, execCmd string, maxPeers int) error {
         gsConn := firstConn
         // Backoff for reconnect retries. Starts at 1s, doubles on each
         // consecutive failure, caps at 10s. Reset to 1s on success.
@@ -57,6 +77,13 @@ func runMultiPeerInteractiveServer(firstConn *gsconn.Conn, secret, relayHost str
         backoff := time.Second
         const maxBackoff = 10 * time.Second
         for peerIdx := 0; ; peerIdx++ {
+                // v0.2.0: --max-peers enforcement. Exit cleanly when limit reached.
+                if maxPeers > 0 && peerIdx >= maxPeers {
+                        if verbose {
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] multi-peer: max-peers %d reached, exiting\n", maxPeers)
+                        }
+                        return nil
+                }
                 if gsConn == nil {
                         // Re-register with the relay. The previous listener has
                         // been closed (gsConn.Close() below), so the relay

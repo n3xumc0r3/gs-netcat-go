@@ -1,46 +1,69 @@
-// v0.1.30: JSON structured logging (--json-logs).
+// v0.2.0: --json-logs structured logging helper.
 //
-// Replaces the standard log package's text output with one JSON object
-// per line on stderr. Format compatible with Loki/ELK/Splunk ingestion.
+// Provides a `logf()` function that replaces `fmt.Fprintf(os.Stderr, "[gs-netcat] ...")`.
+// When --json-logs is active, logf emits a JSON object per line:
 //
-// Each log line is:
-//   {"ts":"2026-10-17T22:30:15.123Z","level":"info","msg":"..."}
+//   {"ts":"2026-10-18T07:00:00.123Z","level":"info","msg":"..."}
 //
-// Wire compat: [--] local-only.
+// When --json-logs is NOT active, logf emits the same plain-text format
+// as before (backwards compatible).
+//
+// Migration strategy: gradually replace `fmt.Fprintf(os.Stderr, "[gs-netcat] ...")`
+// calls with `logf(...)`. The most common ones are converted; the rest
+// remain as plain stderr writes (which --json-logs leaves untouched).
 package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
+	"sync"
 	"time"
 )
 
-// jsonLogWriter is a thin io.Writer that wraps each Write call in a
-// JSON object and emits to the underlying writer (typically os.Stderr).
-type jsonLogWriter struct {
-	out io.Writer
+// jsonLogsEnabled is set by main.go when --json-logs is parsed.
+var jsonLogsEnabled bool
+
+// jsonMu serializes JSON log writes so they don't interleave on stderr.
+var jsonMu sync.Mutex
+
+// logf prints a [gs-netcat]-prefixed log line. If --json-logs is enabled,
+// emits a JSON object instead. Format and args are fmt.Printf-style.
+func logf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if jsonLogsEnabled {
+		jsonMu.Lock()
+		defer jsonMu.Unlock()
+		obj := map[string]interface{}{
+			"ts":    time.Now().UTC().Format(time.RFC3339Nano),
+			"level": "info",
+			"msg":   msg,
+			"src":   "gs-netcat",
+		}
+		enc := json.NewEncoder(os.Stderr)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(obj)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[gs-netcat] %s\n", msg)
 }
 
-func (w *jsonLogWriter) Write(p []byte) (int, error) {
-	// The log package already adds a newline; strip it before JSON-encoding
-	// the message.
-	msg := string(p)
-	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
-		msg = msg[:len(msg)-1]
+// logErrf is like logf but uses level="error".
+func logErrf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if jsonLogsEnabled {
+		jsonMu.Lock()
+		defer jsonMu.Unlock()
+		obj := map[string]interface{}{
+			"ts":    time.Now().UTC().Format(time.RFC3339Nano),
+			"level": "error",
+			"msg":   msg,
+			"src":   "gs-netcat",
+		}
+		enc := json.NewEncoder(os.Stderr)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(obj)
+		return
 	}
-	obj := map[string]interface{}{
-		"ts":    time.Now().UTC().Format(time.RFC3339Nano),
-		"level": "info",
-		"msg":   msg,
-	}
-	enc := json.NewEncoder(w.out)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(obj); err != nil {
-		// Fallback: write raw text if JSON encoding fails.
-		fmt.Fprintf(os.Stderr, "[json-logs-encode-error] %v: %s\n", err, msg)
-		return len(p), nil
-	}
-	return len(p), nil
+	fmt.Fprintf(os.Stderr, "[gs-netcat] ERROR: %s\n", msg)
 }

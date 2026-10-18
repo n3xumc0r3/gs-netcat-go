@@ -300,7 +300,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.1.30-feat"
+        const defaultVersion = "v0.2.0-feat"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -521,7 +521,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         return fmt.Errorf("--multi-relay: no valid entries in %q", flagMultiRelay)
                 }
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] multi-relay: %d relay candidates (will try in order)\n", len(relays))
+                        logf("multi-relay: %d relay candidates (will try in order)", len(relays))
                 }
                 multiRelayList = relays
                 // Use first entry as the primary for the initial attempt.
@@ -538,7 +538,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 }
                 torProxyAddr = flagTorProxy
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] routing relay connection via Tor SOCKS5 proxy %s\n", flagTorProxy)
+                        logf("routing relay connection via Tor SOCKS5 proxy %s", flagTorProxy)
                 }
         }
 
@@ -547,10 +547,15 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 ipv6Preferred = true
         }
 
-        // v0.1.30: --json-logs. Switch the standard logger to JSON output.
+        // v0.2.0: --json-logs. Set the global flag — logf()/logErrf() will
+        // emit JSON instead of plain text. Also configure log package to
+        // not double-prefix (so log.Printf goes through jsonLogWriter-like
+        // behavior). For now, only logf() goes through JSON path; the
+        // existing fmt.Fprintf calls remain plain text (acceptable for
+        // v0.2.0 — most user-visible messages now use logf).
         if flagJSONLogs {
+                jsonLogsEnabled = true
                 log.SetFlags(0)
-                log.SetOutput(&jsonLogWriter{out: os.Stderr})
         }
 
         // -t: test mode (no data path, no secret prompt, just probe the
@@ -563,7 +568,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         // (it sets SERVER_CHECK on _gs_connect; listeners
                         // don't send that flag). We honor -t -l by ignoring
                         // -l to avoid confusing the user.
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] -t is a client-only flag; ignoring -l\n")
+                        logf("-t is a client-only flag; ignoring -l")
                 }
                 return testModeExitError{code: runTestMode(secret, relayHost, relayPort, verbose)}
         }
@@ -591,7 +596,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // single-shot behavior can pass --no-watchdog (a new flag).
         if flagDaemon && !flagWatch && !flagNoWatchdog {
                 if verbose || !quiet {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] -D implies -W (auto-restart on disconnect, matches C gs-netcat). Pass --no-watchdog for single-shot behavior.\n")
+                        logf("-D implies -W (auto-restart on disconnect, matches C gs-netcat). Pass --no-watchdog for single-shot behavior.")
                 }
                 flagWatch = true
         }
@@ -705,37 +710,17 @@ Example SOCKS5 server (tunnel all local apps through remote):
 
         // v0.1.30: --tor / -T. Install a Dialer in opts so gsrn.Dial
         // routes the relay TCP connection via the configured SOCKS5 proxy.
-        // If --stealth-https is also set, the dialer ALSO wraps the
-        // resulting TCP conn in fake TLS record framing (Go-Go only).
-        if flagTorProxy != "" || flagStealthHTTPS {
+        // v0.2.0: --stealth-https is now applied AFTER gsconn.Dial (not
+        // in the dialer), because the fake TLS framing wraps the GS
+        // application-data channel, NOT the relay TCP connection.
+        // The relay needs to see plaintext _gs_listen/_gs_connect on its
+        // side; the fake TLS records flow between the two peers only.
+        if flagTorProxy != "" {
                 opts.Dialer = func(host, port string) (net.Conn, error) {
-                        var c net.Conn
-                        var err error
-                        if flagTorProxy != "" {
-                                // dialViaTor reads torProxyAddr (set in main)
-                                c, err = dialViaTor(host, port)
-                                if err != nil {
-                                        return nil, err
-                                }
-                        } else {
-                                c, err = net.DialTimeout("tcp",
-                                        net.JoinHostPort(host, port), 15*time.Second)
-                                if err != nil {
-                                        return nil, err
-                                }
-                        }
-                        if flagStealthHTTPS {
-                                sc := newStealthConn(c)
-                                // Write our fake ClientHello, read peer's.
-                                if err := sc.WriteClientHello(); err != nil {
-                                        c.Close()
-                                        return nil, fmt.Errorf("stealth: write ClientHello: %w", err)
-                                }
-                                if err := sc.ReadClientHello(); err != nil {
-                                        c.Close()
-                                        return nil, fmt.Errorf("stealth: read peer ClientHello: %w", err)
-                                }
-                                return sc, nil
+                        // dialViaTor reads torProxyAddr (set in main)
+                        c, err := dialViaTor(host, port)
+                        if err != nil {
+                                return nil, err
                         }
                         return c, nil
                 }
@@ -751,7 +736,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // lifecycle (multi-peer, multiple concurrent conns).
         if flagPort > 0 && !listen {
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] client port-forward: local :%d → GS\n", flagPort)
+                        logf("client port-forward: local :%d → GS", flagPort)
                 }
                 return runPortForwardClient(secret, relayHost, relayPort, flagPort, opts, verbose)
         }
@@ -760,7 +745,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         return fmt.Errorf("-l -p <port> requires -d <ip>")
                 }
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] server port-forward: GS → %s:%d\n", flagDstIP, flagPort)
+                        logf("server port-forward: GS → %s:%d", flagDstIP, flagPort)
                 }
                 return runPortForwardServer(secret, relayHost, relayPort, flagDstIP, flagPort, opts, verbose)
         }
@@ -771,7 +756,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // this also crashed after 30s with i/o timeout because of a
         // too-short handshake deadline; that's now fixed.)
         if listen && verbose {
-                fmt.Fprintf(os.Stderr, "[gs-netcat] listening for incoming GS connections (will block until a peer connects)...\n")
+                logf("listening for incoming GS connections (will block until a peer connects)...")
         }
         // v0.1.18: DPI/TSPU port-443 fallback.
         //
@@ -811,31 +796,23 @@ Example SOCKS5 server (tunnel all local apps through remote):
         }
         defer conn.Close()
 
-        // v0.1.30: wrap conn with rate-limit, audit-log, compress as configured.
-        wrappedConn := wrapConn(conn, flagRateLimit, flagAuditLog, flagCompress, verbose)
-        if wrappedConn != conn {
-                defer wrappedConn.Close()
-        }
-        // Replace the local variable so the rest of the function uses the
-        // wrapped conn. We use a type assertion to get back *gsconn.Conn
-        // since the wrappers preserve the underlying type via delegation
-        // (the wrappers satisfy io.ReadWriteCloser; gsconn.Conn methods
-        // remain accessible via the original pointer).
-        //
-        // For now, the wrappers are ONLY applied to the raw cat-mode data
-        // path. Interactive mode (-i) uses conn.WriteMsg/WriteWSIZE/etc
-        // which go through the gsconn-specific API, not io.Writer. To keep
-        // things simple in v0.1.30, audit/compress/rate-limit apply to the
-        // raw cat-mode path only. Interactive mode ignores them (with a
-        // warning if the user combines them).
-        if !interactive && (flagRateLimit != "" || flagAuditLog != "" || flagCompress != "") {
-                // Use wrappedConn for raw mode data plumbing.
-                // We can't directly replace `conn` because it's *gsconn.Conn,
-                // but the io.Copy calls in raw mode use Read/Write methods
-                // which we'd want to intercept. For now, log a TODO.
+        // v0.2.0: wrap conn with rate-limit, audit-log, compress as configured.
+        // This modifies the conn in-place (WrapRawConn replaces the underlying
+        // io.ReadWriteCloser). Works for BOTH raw cat-mode AND interactive mode
+        // (-i), since the wrappers sit below the gsconn.Conn abstraction.
+        // All subsequent Read/Write/WriteMsg calls go through the wrappers.
+        wrapConn(conn, flagRateLimit, flagAuditLog, flagCompress, verbose)
+
+        // v0.2.0: --stealth-https. Wrap rawConn with fake TLS record framing.
+        // Done AFTER wrapConn (so it's the outermost wrapper) — DPI sees
+        // the fake TLS records, not the underlying (potentially compressed)
+        // bytes. clientSide = !listen (the SSL-CLIENT initiates the handshake).
+        if flagStealthHTTPS {
+                clientSide := !listen
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] note: --rate-limit / --audit-log / --compress wrappers active (raw cat mode only)\n")
+                        logf("stealth-https: wrapping rawConn with fake TLS framing (clientSide=%v)", clientSide)
                 }
+                conn.WrapRawConn(newStealthConn(conn.RawConn(), clientSide))
         }
 
         // v0.1.30: --max-session-time. Install a timer that closes conn
@@ -846,7 +823,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         t := time.NewTimer(time.Duration(flagMaxSessionTime) * time.Second)
                         defer t.Stop()
                         <-t.C
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] max-session-time %ds reached, closing\n", flagMaxSessionTime)
+                        logf("max-session-time %ds reached, closing", flagMaxSessionTime)
                         _ = conn.Close()
                 }()
         }
@@ -859,7 +836,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         cmd.Stdout = os.Stderr
                         cmd.Stderr = os.Stderr
                         if err := cmd.Run(); err != nil {
-                                fmt.Fprintf(os.Stderr, "[gs-netcat] post-exec error: %v\n", err)
+                                logf("post-exec error: %v", err)
                         }
                 }()
         }
@@ -875,7 +852,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 defer f.Close()
                 outWriter = f
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] output -> %s\n", flagOutFile)
+                        logf("output -> %s", flagOutFile)
                 }
         }
         _ = outWriter // used below in raw cat-mode
@@ -920,7 +897,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         // Multi-peer: server side re-listens after each peer.
                         // Pass the already-established conn as the first peer
                         // so we don't waste the completed TLS handshake.
-                        return runMultiPeerInteractiveServer(conn, secret, relayHost, relayPort, opts, verbose, execCmd)
+                        return runMultiPeerInteractiveServer(conn, secret, relayHost, relayPort, opts, verbose, execCmd, flagMaxPeers)
                 }
                 return runInteractive(conn, verbose, listen, wantPwd, wantIDS, execCmd)
         }
@@ -1152,7 +1129,7 @@ func runInteractiveServer(conn *gsconn.Conn, ctx *eventCtx, verbose bool, remote
         ctx.pty = pty
         ctx.pid = pty.PID()
         if verbose {
-                fmt.Fprintf(os.Stderr, "[gs-netcat] PTY spawned (cols=%d rows=%d pid=%d)\n", cols, rows, ctx.pid)
+                logf("PTY spawned (cols=%d rows=%d pid=%d)", cols, rows, ctx.pid)
         }
 
         // Pipe conn <-> pty. Conn.Read returns decoded bytes
@@ -1203,7 +1180,7 @@ func runInteractiveServer(conn *gsconn.Conn, ctx *eventCtx, verbose bool, remote
         case err := <-shellDone:
                 // Shell exited — close the conn so remote sees EOF.
                 if verbose && err != nil {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] shell exited: %v\n", err)
+                        logf("shell exited: %v", err)
                 }
                 conn.Close()
                 <-remoteClosed
@@ -1250,11 +1227,11 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
         cols, rows := gspty.GetStdinWindowSize()
         if err := conn.WriteWSIZE(cols, rows); err != nil {
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] initial WSIZE send failed: %v\n", err)
+                        logf("initial WSIZE send failed: %v", err)
                 }
         }
         if verbose {
-                fmt.Fprintf(os.Stderr, "[gs-netcat] sent initial WSIZE cols=%d rows=%d\n", cols, rows)
+                logf("sent initial WSIZE cols=%d rows=%d", cols, rows)
         }
 
         // Optional one-shot PWD request: the server's reply (ChnPWD) is
@@ -1265,7 +1242,7 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
         if wantPwd {
                 if err := conn.WritePWDRequest(); err != nil {
                         if verbose {
-                                fmt.Fprintf(os.Stderr, "[gs-netcat] PWD request send failed: %v\n", err)
+                                logf("PWD request send failed: %v", err)
                         }
                 } else if verbose {
                         fmt.Fprintf(os.Stderr, "[gs-netcat] sent PWD request\n")
@@ -1283,7 +1260,7 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
                 // flags = 0x01 (GS_PKT_APP_FL_IDS).
                 if err := conn.WriteMsg(gspkt.MsgIDS, []byte{0x01, 0, 0, 0}); err != nil {
                         if verbose {
-                                fmt.Fprintf(os.Stderr, "[gs-netcat] IDS subscription send failed: %v\n", err)
+                                logf("IDS subscription send failed: %v", err)
                         }
                 } else if verbose {
                         fmt.Fprintf(os.Stderr, "[gs-netcat] sent IDS subscription request\n")
@@ -1304,7 +1281,7 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
                                 return
                         }
                         if verbose {
-                                fmt.Fprintf(os.Stderr, "[gs-netcat] sent WSIZE cols=%d rows=%d\n", c, r)
+                                logf("sent WSIZE cols=%d rows=%d", c, r)
                         }
                 }
         }()
@@ -1451,7 +1428,7 @@ func dialWithPortFallback(secret string, mode gsconn.Mode, opts *gsconn.Options,
                 conn, err2 := gsconn.Dial(secret, mode, opts)
                 if err2 == nil {
                         if verbose {
-                                fmt.Fprintf(os.Stderr, "[gs-netcat] connected on port %d after %d retries.\n", port, attempt)
+                                logf("connected on port %d after %d retries.", port, attempt)
                         }
                         return conn, nil
                 }
@@ -1475,19 +1452,19 @@ func dialWithPortFallback(secret string, mode gsconn.Mode, opts *gsconn.Options,
                         continue
                 }
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] retrying on port %d...\n", altPort)
+                        logf("retrying on port %d...", altPort)
                 }
                 opts.RelayHost = host
                 opts.RelayPort = altPort
                 conn, err2 := gsconn.Dial(secret, mode, opts)
                 if err2 == nil {
                         if verbose {
-                                fmt.Fprintf(os.Stderr, "[gs-netcat] connected on port %d. TIP: pass --relay %s:%d to skip the 443 probe next time.\n", altPort, host, altPort)
+                                logf("connected on port %d. TIP: pass --relay %s:%d to skip the 443 probe next time.", altPort, host, altPort)
                         }
                         return conn, nil
                 }
                 if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] port %d: %v\n", altPort, err2)
+                        logf("port %d: %v", altPort, err2)
                 }
                 // If this port ALSO gave instant EOF, keep trying the
                 // next one. If it gave a different error (e.g.
@@ -1645,7 +1622,7 @@ func handleMessage(conn *gsconn.Conn, ctx *eventCtx, ev gspkt.Event, verbose boo
                         // the PTY failed (helps diagnose ConPTY/forkpty issues).
                         if st == 0x01 {
                                 if msg != "" {
-                                        fmt.Fprintf(os.Stderr, "[gs-netcat] remote has no PTY — interactive shell unavailable (%s)\n", msg)
+                                        logf("remote has no PTY — interactive shell unavailable (%s)", msg)
                                 } else {
                                         fmt.Fprintf(os.Stderr, "[gs-netcat] remote has no PTY — interactive shell unavailable\n")
                                 }

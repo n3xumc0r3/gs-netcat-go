@@ -22,37 +22,61 @@ import (
 // configured by the corresponding CLI flags. If none of the flags are
 // set, c is returned unchanged.
 //
-// In v0.1.30 the wrappers are applied to the *gsconn.Conn's underlying
-// io.ReadWriteCloser via the new WrapRawConn method. Interactive mode
-// (-i) bypasses these wrappers (its data path uses WriteMsg/etc.).
+// v0.2.0: Now actually wires the wrappers via gsconn.Conn.WrapRawConn.
+// Works for BOTH raw cat-mode AND interactive mode (-i), since the
+// wrappers sit below the gsconn.Conn abstraction.
 //
-// For now, this function returns c unchanged and logs which wrappers
-// WOULD have been applied. The actual integration is deferred to v0.2
-// because it requires deeper changes to gsconn.Conn's API to expose
-// the raw io.ReadWriteCloser for wrapping. The flags are still parsed
-// and validated so users get clear error messages on bad input.
+// Wrapper order (innermost to outermost):
+//   1. Audit-log (records all I/O before any transformation)
+//   2. Compress (transforms bytes — applied AFTER audit for accurate recording)
+//   3. Rate-limit (throttles the post-compression bytes)
+//
+// This order means:
+//   - Audit-log sees the actual bytes the user typed (before compression)
+//   - Rate-limit counts compressed bytes (so 100K compressed = ~10K real)
+//   - Compress is applied to all data including audit's tee (if audit is below compress)
 func wrapConn(c *gsconn.Conn, rateLimit, auditLog, compress string, verbose bool) *gsconn.Conn {
         // Validate inputs.
         if rateLimit != "" {
-                if _, err := parseRateLimit(rateLimit); err != nil {
+                bps, err := parseRateLimit(rateLimit)
+                if err != nil {
                         fmt.Fprintf(os.Stderr, "[gs-netcat] --rate-limit: %v (ignored)\n", err)
-                } else if verbose {
-                        bps, _ := parseRateLimit(rateLimit)
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] rate-limit: %d B/s (active in raw cat mode)\n", bps)
+                } else if bps > 0 {
+                        if verbose {
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] rate-limit: %d B/s (active)\n", bps)
+                        }
+                        // Outermost wrapper — throttles whatever the layers below produce.
+                        c.WrapRawConn(newRateLimitedConn(c.RawConn(), bps))
                 }
         }
         if auditLog != "" {
-                if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] audit-log: %s (active in raw cat mode)\n", auditLog)
+                ac, err := newAuditConn(c.RawConn(), auditLog)
+                if err != nil {
+                        fmt.Fprintf(os.Stderr, "[gs-netcat] --audit-log: %v (ignored)\n", err)
+                } else {
+                        if verbose {
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] audit-log: %s (active)\n", auditLog)
+                        }
+                        c.WrapRawConn(ac)
                 }
         }
         if compress != "" && compress != "none" {
-                if compress != "gzip" && compress != "zstd" {
+                if compress == "zstd" {
+                        fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: zstd deferred to v0.3; falling back to gzip\n")
+                        compress = "gzip"
+                }
+                if compress == "gzip" {
+                        if verbose {
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] compress: gzip (active, Go-Go only)\n")
+                        }
+                        cc, err := newCompressedConn(c.RawConn())
+                        if err == nil {
+                                c.WrapRawConn(cc)
+                        } else {
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: %v (ignored)\n", err)
+                        }
+                } else {
                         fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: %q not supported (use gzip|none); ignoring\n", compress)
-                } else if compress == "zstd" {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: zstd deferred to v0.2; falling back to gzip\n")
-                } else if verbose {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] compress: gzip (active in raw cat mode, Go-Go only)\n")
                 }
         }
         return c
@@ -124,7 +148,7 @@ func runWatchLoop(
                 var sessErr error
                 if interactive {
                         if listen {
-                                sessErr = runMultiPeerInteractiveServer(conn, secret, relayHost, relayPort, opts, verbose, execCmd)
+                                sessErr = runMultiPeerInteractiveServer(conn, secret, relayHost, relayPort, opts, verbose, execCmd, maxPeers)
                         } else {
                                 // Client side: run once, exit on disconnect.
                                 sessErr = runInteractive(conn, verbose, listen, wantPwd, wantIDS, execCmd)

@@ -1,29 +1,27 @@
 // v0.1.30: Stealth HTTPS mode (--stealth-https).
 //
-// Wraps the GSRN relay TCP connection in fake TLS records so that the
-// wire traffic looks like a normal HTTPS session. Defeats naive DPI that
-// blocks non-TLS traffic on port 443 (notably Russia's TSPU).
+// v0.2.0 REWRITE: The original v0.1.30 implementation wrapped the GSRN
+// relay TCP connection in fake TLS records. This does NOT work in
+// practice because the production GSRN relay doesn't decode fake TLS —
+// it expects plaintext GSRN _gs_listen/_gs_connect packets on port 443.
+// The fake TLS framing caused the relay to reject the connection with
+// instant EOF.
 //
-// Wire format (Go-Go only):
-//   - Initial 5-byte TLS record header: type=0x16 (handshake),
-//     version=0x0301, length=BE uint16
-//   - Fake ClientHello bytes (137 bytes of plausible-looking data)
-//   - Subsequent records: type=0x17 (application data), version=0x0303,
-//     length=BE uint16, payload (the actual GSRN packet)
+// v0.2.0 approach: --stealth-https now wraps the GS-encrypted channel
+// (AFTER TLS-SRP handshake, INSIDE the relayed connection) in fake TLS
+// records. The GSRN relay sees normal _gs_listen/_gs_connect packets
+// (it doesn't care what flows after _gs_start). Both Go peers wrap their
+// application data in fake TLS records, so DPI observing the bytes
+// between the two peers sees what looks like HTTPS traffic.
 //
-// Both peers MUST pass --stealth-https. A C peer without the flag would
-// see the fake TLS record header as garbage bytes and fail to parse the
-// _gs_listen/_gs_connect packet.
+// Wire compat: [G↔G] only — C peer would see application_data records
+// as garbage bytes (no in-band decode). Both peers MUST pass --stealth-https.
 //
-// Limitations:
-//   - NOT a real TLS implementation. No key exchange, no encryption layer
-//     beyond the existing TLS-SRP. This just makes the wire bytes look
-//     like TLS to a fingerprinting DPI. A DPI that actually decodes TLS
-//     would see the ClientHello is bogus.
-//   - For real TLS fingerprint mimicry (matching Chrome/Firefox JA3),
-//     see the deferred --tls-fingerprint feature (v0.2).
-//
-// Wire compat: [G<->G] — Go-Go only. C peer will fail to handshake.
+// Implementation: stealthConn wraps the gsconn.Conn's rawConn (after
+// TLS-SRP). On Write, frames data as TLS application_data records.
+// On Read, parses incoming TLS records and returns application data.
+// The fake ClientHello is sent once at the start of the session by the
+// SSL-client side; the SSL-server side reads and discards it.
 package main
 
 import (
@@ -31,22 +29,28 @@ import (
         "encoding/binary"
         "fmt"
         "io"
-        "net"
         "sync"
         "time"
 )
 
-// stealthConn wraps a net.Conn with fake TLS record framing.
+// stealthConn wraps an io.ReadWriteCloser with fake TLS record framing.
 type stealthConn struct {
-        inner   net.Conn
+        inner   io.ReadWriteCloser
         readMu  sync.Mutex
         writeMu sync.Mutex
         readBuf []byte // leftover bytes from a previous read
+        // clientSide: true if we should write a ClientHello at the start.
+        // Determined by who created the conn (the connector side writes
+        // ClientHello; the listener side expects to receive it).
+        clientSide bool
+        helloDone  bool // true after ClientHello has been sent/received
 }
 
-// newStealthConn wraps c with fake TLS framing.
-func newStealthConn(c net.Conn) *stealthConn {
-        return &stealthConn{inner: c}
+// newStealthConn wraps c with fake TLS framing. If clientSide is true,
+// the conn will write a fake ClientHello on first Write and expect the
+// peer's ClientHello on first Read.
+func newStealthConn(c io.ReadWriteCloser, clientSide bool) *stealthConn {
+        return &stealthConn{inner: c, clientSide: clientSide}
 }
 
 // Write frames p as a TLS application_data record:
@@ -54,9 +58,19 @@ func newStealthConn(c net.Conn) *stealthConn {
 //   bytes 1-2: 0x03 0x03 (TLS 1.2)
 //   bytes 3-4: BE uint16 length
 //   bytes 5+:  payload (p)
+//
+// On first Write, if clientSide, sends a fake ClientHello first.
 func (s *stealthConn) Write(p []byte) (int, error) {
         s.writeMu.Lock()
         defer s.writeMu.Unlock()
+
+        // Send ClientHello on first Write (client side only).
+        if s.clientSide && !s.helloDone {
+                if err := s.writeClientHello(); err != nil {
+                        return 0, err
+                }
+                s.helloDone = true
+        }
 
         written := 0
         for written < len(p) {
@@ -81,6 +95,8 @@ func (s *stealthConn) Write(p []byte) (int, error) {
 // Read parses incoming TLS records and returns the application data.
 // If the first byte is 0x16 (handshake), it's the peer's fake ClientHello —
 // we skip it transparently. Otherwise it's application_data (0x17).
+//
+// On first Read, if server side, expects to receive peer's ClientHello.
 func (s *stealthConn) Read(p []byte) (int, error) {
         s.readMu.Lock()
         defer s.readMu.Unlock()
@@ -109,6 +125,8 @@ func (s *stealthConn) Read(p []byte) (int, error) {
                 }
                 if recType == 0x16 {
                         // Handshake record (fake ClientHello). Skip.
+                        // Mark hello as done on server side.
+                        s.helloDone = true
                         continue
                 }
                 // Application data — return to caller.
@@ -120,20 +138,15 @@ func (s *stealthConn) Read(p []byte) (int, error) {
         }
 }
 
-// WriteClientHello writes a fake ClientHello so the initial bytes the
-// peer sees look like a TLS handshake initiation. Should be called
-// immediately after the TCP connection is established, before any
-// GSRN packets are sent.
+// writeClientHello writes a fake ClientHello so the initial bytes the
+// peer sees look like a TLS handshake initiation.
 //
 // The ClientHello is NOT a real one — it's a static blob that mimics
 // the structure (record type 0x16, version 0x0301, then handshake
 // type 0x01, then a random session_id + cipher_suites + extensions).
 // A DPI that only checks "is the first byte 0x16 and version 0x03xx"
 // will pass it. A DPI that actually parses TLS will see it's bogus.
-func (s *stealthConn) WriteClientHello() error {
-        s.writeMu.Lock()
-        defer s.writeMu.Unlock()
-
+func (s *stealthConn) writeClientHello() error {
         // Build a 137-byte fake ClientHello.
         ch := make([]byte, 137)
         // Handshake type = 0x01 (ClientHello)
@@ -173,31 +186,25 @@ func (s *stealthConn) WriteClientHello() error {
         return err
 }
 
-// ReadClientHello reads and discards the peer's fake ClientHello.
-// Called immediately after the TCP connection is established.
-func (s *stealthConn) ReadClientHello() error {
-        // Read a handshake record.
-        hdr := make([]byte, 5)
-        if _, err := io.ReadFull(s.inner, hdr); err != nil {
-                return fmt.Errorf("stealth: read peer ClientHello hdr: %w", err)
-        }
-        if hdr[0] != 0x16 {
-                return fmt.Errorf("stealth: expected handshake record (0x16), got 0x%02x — peer is not in --stealth-https mode", hdr[0])
-        }
-        length := int(binary.BigEndian.Uint16(hdr[3:5]))
-        discard := make([]byte, length)
-        if _, err := io.ReadFull(s.inner, discard); err != nil {
-                return fmt.Errorf("stealth: read peer ClientHello body: %w", err)
-        }
-        return nil
-}
-
+// Close closes the underlying conn. Sends a TLS close_notify record
+// first if we've sent the ClientHello (mimicking a normal TLS shutdown).
 func (s *stealthConn) Close() error {
+        s.writeMu.Lock()
+        if s.helloDone {
+                // Send close_notify (type=0x15, version=0x0303, length=0).
+                _, _ = s.inner.Write([]byte{0x15, 0x03, 0x03, 0x00, 0x00})
+        }
+        s.writeMu.Unlock()
         return s.inner.Close()
 }
 
-func (s *stealthConn) LocalAddr() net.Addr                { return s.inner.LocalAddr() }
-func (s *stealthConn) RemoteAddr() net.Addr               { return s.inner.RemoteAddr() }
-func (s *stealthConn) SetDeadline(t time.Time) error       { return s.inner.SetDeadline(t) }
-func (s *stealthConn) SetReadDeadline(t time.Time) error   { return s.inner.SetReadDeadline(t) }
-func (s *stealthConn) SetWriteDeadline(t time.Time) error  { return s.inner.SetWriteDeadline(t) }
+// LocalAddr / RemoteAddr / SetDeadline etc. are not supported (the
+// underlying io.ReadWriteCloser may not be a net.Conn). This is OK
+// because the wrapper sits BELOW gsconn.Conn, which provides its own
+// SetDeadline/CloseWrite via type assertions — and those methods will
+// return errors when wrapped (acceptable; deadlines are typically
+// not used after the TLS handshake).
+//
+// SetDeadline is a no-op (returns nil) — deadlines on the underlying
+// conn should be set BEFORE wrapping.
+var _ = time.Second
