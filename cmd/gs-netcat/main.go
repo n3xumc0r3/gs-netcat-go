@@ -294,6 +294,8 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 flagHTTPProxy     bool   // --http-proxy
                 flagCompress      string // --compress
                 flagStealthHTTPS  bool   // --stealth-https
+                flagSFTP          string // --sftp <dir>
+                flagFileServer    bool   // --file-server (alias)
         )
 
         // Version is injected at build time via -ldflags. The default value
@@ -361,6 +363,8 @@ Example SOCKS5 server (tunnel all local apps through remote):
         fs.BoolVar(&flagHTTPProxy, "http-proxy", false, "Act as HTTP CONNECT proxy server (needs -l; listens on -p port) [G↔C]")
         fs.StringVar(&flagCompress, "compress", "", "Compress data stream: zstd|gzip|none (Go-Go only; C peer would see encoded bytes) [G↔G]")
         fs.BoolVar(&flagStealthHTTPS, "stealth-https", false, "Wrap GSRN packets in fake TLS records (Go-Go only; bypasses port-443 DPI) [G↔G]")
+        fs.StringVar(&flagSFTP, "sftp", "", "Run as simplified SFTP file server rooted at <dir> [G↔C]")
+        fs.BoolVar(&flagFileServer, "file-server", false, "Alias for --sftp (legacy name)")
 
         if err := fs.Parse(args); err != nil {
                 // -h / --help / -help / --h: Go's flag package has
@@ -869,8 +873,22 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 if interactive {
                         modeExtra = " [in-band]"
                 }
+                if flagSFTP != "" || flagFileServer {
+                        modeExtra = " [SFTP server]"
+                }
                 fmt.Fprintf(os.Stderr, "Connected (role=%s%s). Press Ctrl-D to exit.\n",
                         roleStr(conn.Role()), modeExtra)
+        }
+
+        // v0.2.0: --sftp / --file-server mode. Run the simplified SFTP
+        // server over the established connection. Takes precedence over
+        // raw cat-mode AND interactive mode.
+        if flagSFTP != "" || flagFileServer {
+                rootDir := flagSFTP
+                if rootDir == "" {
+                        rootDir = "."
+                }
+                return runSFTPServer(conn, rootDir, verbose)
         }
 
         // In in-band mode, start an event-pump goroutine that handles
