@@ -157,6 +157,10 @@ func (s *stealthConn) Read(p []byte) (int, error) {
 // A DPI that only checks "is the first byte 0x16 and version 0x03xx"
 // will pass it. A DPI that actually parses TLS will see it's bogus.
 func (s *stealthConn) writeClientHello() error {
+        // v0.2.5: Use utls ClientHello if --tls-fingerprint-real is set.
+        if utlsOverrideActive {
+                return writeUTLSClientHello(s, utlsProfileOverride)
+        }
         // v0.2.0: Use profiled ClientHello if available.
         if activeTLSProfile != nil {
                 return writeProfiledClientHello(s, activeTLSProfile)

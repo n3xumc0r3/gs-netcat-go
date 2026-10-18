@@ -299,6 +299,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 flagSFTPReal      string // --sftp-real <dir>
                 flagSFTPRealClient int    // --sftp-real-client <port>
                 flagTLSFingerprint string // --tls-fingerprint <profile>
+                flagTLSFingerprintReal string // --tls-fingerprint-real <profile>
         )
 
         // Version is injected at build time via -ldflags. The default value
@@ -371,6 +372,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         fs.StringVar(&flagSFTPReal, "sftp-real", "", "Run as REAL SFTP server (standard clients: sftp/FileZilla) rooted at <dir> [G↔C]")
         fs.IntVar(&flagSFTPRealClient, "sftp-real-client", 0, "Local TCP port for SFTP client bridge (use with -i --sftp-real-client PORT) [--]")
         fs.StringVar(&flagTLSFingerprint, "tls-fingerprint", "", "Use pre-recorded browser ClientHello profile (chrome|firefox|safari|edge). Requires --stealth-https. [G↔G]")
+        fs.StringVar(&flagTLSFingerprintReal, "tls-fingerprint-real", "", "Use REAL utls ClientHello (chrome|firefox|safari|edge|ios|android|random). Requires --stealth-https. [G↔G]")
 
         if err := fs.Parse(args); err != nil {
                 // -h / --help / -help / --h: Go's flag package has
@@ -822,7 +824,19 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // to use a pre-recorded browser ClientHello (Chrome, Firefox, Safari, Edge).
         // Requires --stealth-https (it modifies the ClientHello the stealth wrapper sends).
         if flagStealthHTTPS {
-                if flagTLSFingerprint != "" {
+                if flagTLSFingerprintReal != "" {
+                        profile, ok := getUTLSProfile(flagTLSFingerprintReal)
+                        if !ok {
+                                return fmt.Errorf("--tls-fingerprint-real: unknown profile %q (available: %v)", flagTLSFingerprintReal, listUTLSProfiles())
+                        }
+                        if verbose {
+                                logf("stealth-https: using REAL utls ClientHello (profile=%s)", flagTLSFingerprintReal)
+                        }
+                        // Override the stealth wrapper's writeClientHello to use utls.
+                        // We do this by setting a global callback that writeClientHello checks.
+                        utlsProfileOverride = profile
+                        utlsOverrideActive = true
+                } else if flagTLSFingerprint != "" {
                         profile := getTLSProfile(flagTLSFingerprint)
                         if profile == nil {
                                 return fmt.Errorf("--tls-fingerprint: unknown profile %q (available: %s)", flagTLSFingerprint, listTLSProfiles())
