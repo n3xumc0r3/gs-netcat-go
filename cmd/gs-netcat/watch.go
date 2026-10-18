@@ -61,22 +61,18 @@ func wrapConn(c *gsconn.Conn, rateLimit, auditLog, compress string, verbose bool
                 }
         }
         if compress != "" && compress != "none" {
-                if compress == "zstd" {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: zstd deferred to v0.3; falling back to gzip\n")
-                        compress = "gzip"
-                }
-                if compress == "gzip" {
+                if compress == "zstd" || compress == "gzip" {
                         if verbose {
-                                fmt.Fprintf(os.Stderr, "[gs-netcat] compress: gzip (active, Go-Go only)\n")
+                                fmt.Fprintf(os.Stderr, "[gs-netcat] compress: %s (active, Go-Go only)\n", compress)
                         }
-                        cc, err := newCompressedConn(c.RawConn())
+                        cc, err := newCompressedConnByName(c.RawConn(), compress)
                         if err == nil {
                                 c.WrapRawConn(cc)
                         } else {
                                 fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: %v (ignored)\n", err)
                         }
                 } else {
-                        fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: %q not supported (use gzip|none); ignoring\n", compress)
+                        fmt.Fprintf(os.Stderr, "[gs-netcat] --compress: %q not supported (use gzip|zstd|none); ignoring\n", compress)
                 }
         }
         return c

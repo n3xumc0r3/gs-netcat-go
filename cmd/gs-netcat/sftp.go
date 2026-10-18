@@ -68,7 +68,7 @@ import (
 // This is NOT real SFTP (RFC 4254 + draft-ietf-secsh-filexfer), so
 // standard SFTP clients (sftp, FileZilla) will NOT work. It's a
 // gs-netcat-specific file transfer protocol. For real SFTP support
-// (with pkg/sftp dependency), see v0.3.
+// (with pkg/sftp dependency), see v0.2.5.
 func runSFTPServer(conn *gsconn.Conn, rootDir string, verbose bool) error {
         if rootDir == "" {
                 rootDir, _ = os.Getwd()
@@ -148,7 +148,7 @@ func runSFTPServer(conn *gsconn.Conn, rootDir string, verbose bool) error {
 //   QUIT         → close conn
 //
 // v0.2.0: simplified — no auth, no path traversal protection (yet).
-// v0.3 will add proper SFTP via pkg/sftp.
+// v0.2.5 will add proper SFTP via pkg/sftp.
 func handleSFTPCommand(conn *gsconn.Conn, cmd, root string, verbose bool) error {
         // Trim whitespace.
         for len(cmd) > 0 && (cmd[len(cmd)-1] == '\n' || cmd[len(cmd)-1] == '\r') {
@@ -228,7 +228,7 @@ func sftpGET(conn *gsconn.Conn, path, root string, verbose bool) error {
 // Expects: PUT <path>\n<size>\n<content>
 // Since we don't know the size in advance, we read until we see "END\n".
 // This is simplified — for binary files with "END\n" in them, this breaks.
-// v0.3 will use proper SFTP protocol.
+// v0.2.5 will use proper SFTP protocol.
 func sftpPUT(conn *gsconn.Conn, path, root string, verbose bool) error {
         fullPath := filepath.Join(root, path)
         // Read the file content. The protocol is: PUT <path>\n<size>\n<content>

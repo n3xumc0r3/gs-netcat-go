@@ -23,7 +23,7 @@
 // may still detect the fake.
 //
 // For real JA3 mimicry (full extension payloads, supported_versions,
-// key_share, etc.), see v0.3 (will add github.com/refraction-networking/utls).
+// key_share, etc.), see v0.2.5 (will add github.com/refraction-networking/utls).
 package main
 
 import (
@@ -164,7 +164,7 @@ func listTLSProfiles() string {
 //   - ec_point_formats extension
 //   - supported_groups extension (curves list)
 //
-// Still NOT a fully valid TLS handshake — for that, see v0.3 (utls).
+// Still NOT a fully valid TLS handshake — for that, see v0.2.5 (utls).
 // But it WILL pass JA3 hash matching for the listed browsers.
 func writeProfiledClientHello(s *stealthConn, profile *tlsFingerprintProfile) error {
 	if profile == nil {

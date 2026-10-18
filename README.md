@@ -134,9 +134,9 @@ Stealth (Go-Go only — C peer will not understand):
 ### Not yet implemented
 
 - `-u` UDP port-forward (would break C interop)
-- `--sftp` SFTP subsystem (deferred to v0.2)
-- `--file-server` Built-in file server (deferred to v0.2)
-- `--tls-fingerprint` Real JA3 mimicry via `utls` (deferred to v0.2)
+- `--sftp-real` Real SFTP via `pkg/sftp` (deferred to v0.2.5+; current `--sftp` uses simplified protocol)
+- `--file-server` Built-in file server (use `--sftp` for now)
+- `--tls-fingerprint-real` Real JA3 mimicry via `utls` (deferred to v0.2.5+; current `--tls-fingerprint` uses hardcoded profiles)
 - Console UI commands (`Ctrl-e + c`, etc.)
 - True concurrent multi-peer (current: sequential re-listen after each peer disconnects)
 

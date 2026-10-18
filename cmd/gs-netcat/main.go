@@ -296,6 +296,8 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 flagStealthHTTPS  bool   // --stealth-https
                 flagSFTP          string // --sftp <dir>
                 flagFileServer    bool   // --file-server (alias)
+                flagSFTPReal      string // --sftp-real <dir>
+                flagSFTPRealClient int    // --sftp-real-client <port>
                 flagTLSFingerprint string // --tls-fingerprint <profile>
         )
 
@@ -303,7 +305,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.2.0-feat"
+        const defaultVersion = "v0.2.5-feat"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -366,6 +368,8 @@ Example SOCKS5 server (tunnel all local apps through remote):
         fs.BoolVar(&flagStealthHTTPS, "stealth-https", false, "Wrap GSRN packets in fake TLS records (Go-Go only; bypasses port-443 DPI) [G↔G]")
         fs.StringVar(&flagSFTP, "sftp", "", "Run as simplified SFTP file server rooted at <dir> [G↔C]")
         fs.BoolVar(&flagFileServer, "file-server", false, "Alias for --sftp (legacy name)")
+        fs.StringVar(&flagSFTPReal, "sftp-real", "", "Run as REAL SFTP server (standard clients: sftp/FileZilla) rooted at <dir> [G↔C]")
+        fs.IntVar(&flagSFTPRealClient, "sftp-real-client", 0, "Local TCP port for SFTP client bridge (use with -i --sftp-real-client PORT) [--]")
         fs.StringVar(&flagTLSFingerprint, "tls-fingerprint", "", "Use pre-recorded browser ClientHello profile (chrome|firefox|safari|edge). Requires --stealth-https. [G↔G]")
 
         if err := fs.Parse(args); err != nil {
@@ -906,6 +910,30 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         rootDir = "."
                 }
                 return runSFTPServer(conn, rootDir, verbose)
+        }
+
+        // v0.2.5: --sftp-real mode. Run a REAL SSH+SFTP server over the
+        // established connection. Compatible with standard SFTP clients
+        // (sftp, FileZilla, WinSCP). Requires the CLIENT side to run with
+        // --sftp-real-client PORT which bridges a local TCP port to the
+        // GS-encrypted channel.
+        if flagSFTPReal != "" {
+                rootDir := flagSFTPReal
+                if rootDir == "" {
+                        rootDir = "."
+                }
+                // runSFTPRealServer takes the underlying io.ReadWriteCloser,
+                // not the *gsconn.Conn. Use RawConn() so wrappers (compress
+                // etc.) are bypassed — SSH does its own crypto.
+                return runSFTPRealServer(conn.RawConn(), rootDir, secret, verbose)
+        }
+
+        // v0.2.5: --sftp-real-client mode. The CLIENT side of the SFTP-real
+        // bridge. Listens on local TCP port, accepts SSH connections, and
+        // bridges them through the GS-encrypted channel to the remote
+        // --sftp-real server.
+        if flagSFTPRealClient > 0 {
+                return runSFTPRealClient(conn, flagSFTPRealClient, verbose)
         }
 
         // In in-band mode, start an event-pump goroutine that handles
