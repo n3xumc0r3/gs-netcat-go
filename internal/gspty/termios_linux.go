@@ -110,16 +110,32 @@ func SetRawStdin() (*SavedTermios, error) {
 // (cols, rows). If stdin is not a tty or the ioctl fails, returns
 // (80, 24) — the standard fallback the C original uses in
 // get_winsize() (utils.c line 160).
+//
+// v0.1.30 (P4 fix): probe STDOUT, not STDIN, to match C's
+// get_winsize() (utils.c:154 `ioctl(STDOUT_FILENO, TIOCGWINSZ, ...)`).
+// The previous Go code probed os.Stdin.Fd(), which gave correct results
+// in the common case (stdin and stdout both tty) but diverged from C
+// in edge cases where stdin and stdout differ in tty-ness. This also
+// matches the Windows v0.1.15 fix. Falls back to stderr if stdout is
+// not a tty (e.g. piped to file but stderr still terminal).
 func GetStdinWindowSize() (cols, rows uint16) {
-        fd := int(os.Stdin.Fd())
+        // Try stdout first (matches C).
+        fd := int(os.Stdout.Fd())
         var ws winsize
-        if err := ioctl(fd, tiocgwinsz, uintptr(unsafe.Pointer(&ws))); err != nil {
-                return 80, 24
+        if err := ioctl(fd, tiocgwinsz, uintptr(unsafe.Pointer(&ws))); err == nil && ws.Col != 0 {
+                return ws.Col, ws.Row
         }
-        if ws.Col == 0 {
-                return 80, 24
+        // Try stderr as fallback (e.g. when stdout is piped to file).
+        fd = int(os.Stderr.Fd())
+        if err := ioctl(fd, tiocgwinsz, uintptr(unsafe.Pointer(&ws))); err == nil && ws.Col != 0 {
+                return ws.Col, ws.Row
         }
-        return ws.Col, ws.Row
+        // Final fallback: stdin.
+        fd = int(os.Stdin.Fd())
+        if err := ioctl(fd, tiocgwinsz, uintptr(unsafe.Pointer(&ws))); err == nil && ws.Col != 0 {
+                return ws.Col, ws.Row
+        }
+        return 80, 24
 }
 
 // isTty reports whether fd refers to a terminal. We use ioctl

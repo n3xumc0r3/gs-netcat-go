@@ -373,6 +373,13 @@ type Options struct {
         // PingInterval controls the keepalive ping cadence.  Zero disables
         // pinging (caller takes responsibility for keepalive).
         PingInterval time.Duration
+
+        // v0.1.30: Dialer, if non-nil, replaces the default
+        // net.DialTimeout("tcp", host:port) call. Used by --tor to route
+        // the relay TCP connection via a SOCKS5 proxy. The function
+        // receives the host and port as separate strings and returns a
+        // connected net.Conn (or an error).
+        Dialer func(host, port string) (net.Conn, error)
 }
 
 // DefaultOptions returns sensible defaults for connecting to a relay.
@@ -437,17 +444,41 @@ func Dial(addr [16]byte, listen bool, opts *Options) (*Conn, error) {
                 opts.RelayPort = DefaultPort
         }
 
-        tcpConn, err := net.DialTimeout("tcp",
-                net.JoinHostPort(opts.RelayHost, fmt.Sprintf("%d", opts.RelayPort)),
-                15*time.Second)
-        if err != nil {
-                return nil, fmt.Errorf("gsrn: dial relay: %w", err)
+        // v0.1.30: If a SOCKS5 proxy dialer is configured (e.g. --tor),
+        // use it instead of the direct net.DialTimeout. The Dialer field
+        // is set by the caller via opts.Dialer. nil = direct dial.
+        target := net.JoinHostPort(opts.RelayHost, fmt.Sprintf("%d", opts.RelayPort))
+        var tcpConn net.Conn
+        var err error
+        if opts.Dialer != nil {
+                tcpConn, err = opts.Dialer(opts.RelayHost, fmt.Sprintf("%d", opts.RelayPort))
+                if err != nil {
+                        return nil, fmt.Errorf("gsrn: dial relay via proxy: %w", err)
+                }
+        } else {
+                tcpConn, err = net.DialTimeout("tcp", target, 15*time.Second)
+                if err != nil {
+                        return nil, fmt.Errorf("gsrn: dial relay: %w", err)
+                }
         }
 
         // Build the initial packet.
         var pkt *ListenConnect
         if listen {
-                pkt, err = NewListen(addr[:], opts.Token, opts.Flags)
+                // v0.1.30 (P1 fix): Force flags=0 on LISTEN packets to
+                // match C's gs_pkt_listen_write (lib/gsocket-engine.c:604-626)
+                // which does memset(&glisten, 0, sizeof glisten) and never
+                // sets glisten.flags. The C version stores user CLI flags
+                // in ctx->flags_proto but only propagates them to the wire
+                // on CONNECT packets, not LISTEN.
+                //
+                // The previous Go code passed opts.Flags through, which meant
+                // `--low-latency` or `--cos` with `-l` would set non-zero
+                // flag bits on the LISTEN packet. The production relay
+                // tolerates this (it ignores flags on LISTEN), but a strict
+                // relay could reject it. Now we always send 0x00 on LISTEN,
+                // matching C byte-for-byte.
+                pkt, err = NewListen(addr[:], opts.Token, 0)
         } else {
                 // CONNECT default: set FAST_CONNECT unless the caller asked for
                 // WAIT or CLIENT_OR_SERVER (the two flags documented as

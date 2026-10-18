@@ -31,9 +31,24 @@
 //   - "Watchdog" works the same: parent waits on child process exit,
 //     restarts on death.
 //
-// BAD_AUTH detection (matches C): when -D is set we generate a unique
-// auth-token based on the PID + secret, so a second daemon with the
-// same secret will see BAD_AUTH from the relay and exit(201).
+// BAD_AUTH detection (DIFFERS from C): in C, when -D is set without -a,
+// gs-netcat generates a deterministic token based on getpid()+secret
+// ("%u-BAD-AUTH-CHECK-%s"). Each invocation gets a different PID and
+// thus a different token; the relay rejects the 2nd listener with
+// BAD_AUTH, the child exits 201, the watchdog counts 2 BAD_AUTHs and
+// exits 0 (assuming another daemon is already running).
+//
+// The Go port does NOT replicate this. Instead it generates a RANDOM
+// 16-byte token at startup (see main.go ~line 498) and reuses it
+// across reconnects (the v0.1.11 "Multi-peer token stability fix").
+// The end result is similar — a 2nd daemon gets a different token,
+// the relay rejects it with BAD_AUTH — but the mechanism is different
+// (random vs PID-derived). This is acceptable because:
+//   1. Random tokens provide the same duplicate-detection guarantee.
+//   2. Random tokens survive PID changes (e.g. after exec).
+//   3. PID-based tokens are predictable (attacker can guess the PID).
+// We do NOT claim to match C's exact mechanism here — only the
+// observable behavior (BAD_AUTH on duplicate, watchdog exits after 2).
 package main
 
 import (

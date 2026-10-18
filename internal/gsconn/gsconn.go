@@ -136,6 +136,12 @@ type Options struct {
         // path. Use DialTest instead of Dial for this mode; Dial with
         // ServerCheck set returns an error.
         ServerCheck bool
+
+        // v0.1.30: Dialer, if non-nil, is passed through to gsrn.Dial
+        // to override the default net.DialTimeout. Used by --tor to
+        // route the relay TCP connection via a SOCKS5 proxy, and by
+        // --stealth-https to wrap the resulting conn in fake TLS framing.
+        Dialer func(host, port string) (net.Conn, error)
 }
 
 // DefaultOptions returns a sane starting point.
@@ -359,6 +365,7 @@ func Dial(secret string, mode Mode, opts *Options) (*Conn, error) {
                 RelayPort:    opts.RelayPort,
                 Flags:        opts.FlagExtra,
                 PingInterval: 0, // we'll handle keepalive at this layer
+                Dialer:       opts.Dialer, // v0.1.30: --tor / --stealth-https
         }
 
         // Auth-token policy:
