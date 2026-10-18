@@ -60,12 +60,22 @@ func runSFTPRealServer(gsConn io.ReadWriteCloser, rootDir, secret string, verbos
                 logf("sftp-real: serving %s over GS (auth: gsuser/<secret>)", absRoot)
         }
 
-        // Generate an ephemeral SSH host key (ed25519). Each session gets a
-        // fresh key — clients will see a "host key changed" warning if they
-        // connect multiple times. Acceptable for a transient tunnel.
-        hostKey, err := generateRandomEd25519Signer()
+        // v0.3.0: Persistent host key. We derive an ed25519 key deterministically
+        // from the GS secret (via SHA256). This means the same secret always
+        // produces the same SSH host key — clients won't see "host key changed"
+        // warnings when reconnecting with the same secret.
+        //
+        // Security: this is acceptable because:
+        //   1. The GS channel is already E2E encrypted via TLS-SRP
+        //   2. The SSH host key is just for protocol compatibility — an
+        //      attacker who knows the secret can already MITM the GS channel
+        //      (and thus the SSH layer), so deriving the host key from the
+        //      secret adds no new attack surface.
+        //   3. Without persistence, every reconnect shows a "host key changed"
+        //      warning that breaks automated SFTP clients (WinSCP, lftp).
+        hostKey, err := deriveEd25519SignerFromSecret(secret)
         if err != nil {
-                return fmt.Errorf("sftp-real: gen host key: %w", err)
+                return fmt.Errorf("sftp-real: derive host key: %w", err)
         }
 
         // Configure the SSH server.

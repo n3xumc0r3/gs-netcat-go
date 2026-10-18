@@ -4,6 +4,8 @@ package main
 import (
         "crypto/ed25519"
         cryptorand "crypto/rand"
+        "crypto/sha256"
+        "fmt"
         "io"
         "net"
         "time"
@@ -24,6 +26,41 @@ func generateRandomEd25519Signer() (ssh.Signer, error) {
         if err != nil {
                 return nil, err
         }
+        signer, err := ssh.NewSignerFromKey(priv)
+        if err != nil {
+                return nil, err
+        }
+        return signer, nil
+}
+
+// deriveEd25519SignerFromSecret derives an ed25519 SSH host key
+// deterministically from the GS secret.
+//
+// v0.3.0: This solves the "host key changed" warning that breaks
+// automated SFTP clients (WinSCP, lftp). The same secret always
+// produces the same SSH host key, so clients can pin it once and
+// reconnect without warnings.
+//
+// Implementation: SHA256("sftp-host-key/" || secret) → 32-byte ed25519 seed.
+// ed25519.NewKeyFromSeed takes a 32-byte seed and produces a private key.
+//
+// Security: this is acceptable because:
+//   1. The GS channel is already E2E encrypted via TLS-SRP
+//   2. The SSH host key is just for protocol compatibility
+//   3. An attacker who knows the secret can already MITM the GS channel
+//      (and thus the SSH layer), so deriving the host key from the
+//      secret adds no new attack surface
+//   4. Without persistence, every reconnect shows "host key changed"
+//      warnings that break automated SFTP clients
+func deriveEd25519SignerFromSecret(secret string) (ssh.Signer, error) {
+        h := sha256.New()
+        h.Write([]byte("sftp-host-key/"))
+        h.Write([]byte(secret))
+        seed := h.Sum(nil) // 32 bytes
+        if len(seed) != ed25519.SeedSize {
+                return nil, fmt.Errorf("internal: SHA256 produced %d bytes (want %d)", len(seed), ed25519.SeedSize)
+        }
+        priv := ed25519.NewKeyFromSeed(seed)
         signer, err := ssh.NewSignerFromKey(priv)
         if err != nil {
                 return nil, err

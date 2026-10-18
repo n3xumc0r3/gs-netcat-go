@@ -300,13 +300,14 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 flagSFTPRealClient int    // --sftp-real-client <port>
                 flagTLSFingerprint string // --tls-fingerprint <profile>
                 flagTLSFingerprintReal string // --tls-fingerprint-real <profile>
+                flagConcurrentPeers int    // --concurrent-peers N
         )
 
         // Version is injected at build time via -ldflags. The default value
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.2.5-feat"
+        const defaultVersion = "v0.3.0-feat"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -373,6 +374,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         fs.IntVar(&flagSFTPRealClient, "sftp-real-client", 0, "Local TCP port for SFTP client bridge (use with -i --sftp-real-client PORT) [--]")
         fs.StringVar(&flagTLSFingerprint, "tls-fingerprint", "", "Use pre-recorded browser ClientHello profile (chrome|firefox|safari|edge). Requires --stealth-https. [G↔G]")
         fs.StringVar(&flagTLSFingerprintReal, "tls-fingerprint-real", "", "Use REAL utls ClientHello (chrome|firefox|safari|edge|ios|android|random). Requires --stealth-https. [G↔G]")
+        fs.IntVar(&flagConcurrentPeers, "concurrent-peers", 0, "Max simultaneous concurrent peers in -l -i mode (0=sequential, default; N=true parallelism) [--]")
 
         if err := fs.Parse(args); err != nil {
                 // -h / --help / -help / --h: Go's flag package has
@@ -931,14 +933,25 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // (sftp, FileZilla, WinSCP). Requires the CLIENT side to run with
         // --sftp-real-client PORT which bridges a local TCP port to the
         // GS-encrypted channel.
+        //
+        // v0.3.0: Auto-disable in-band mode if --sftp-real is set, even if
+        // the user passed -i. SSH handshake fails through the in-band
+        // encoder (escape-byte corruption). We call conn.DisableInBand()
+        // which makes subsequent Read/Write pass through to rawConn
+        // directly (no escape-byte encoding/decoding).
         if flagSFTPReal != "" {
                 rootDir := flagSFTPReal
                 if rootDir == "" {
                         rootDir = "."
                 }
-                // runSFTPRealServer takes the underlying io.ReadWriteCloser,
-                // not the *gsconn.Conn. Use RawConn() so wrappers (compress
-                // etc.) are bypassed — SSH does its own crypto.
+                // v0.3.0: Disable in-band mode if -i was set. This makes
+                // Read/Write pass through to rawConn directly.
+                if interactive {
+                        conn.DisableInBand()
+                        if verbose {
+                                logf("note: --sftp-real with -i: disabled in-band encoder (SSH handshake needs raw bytes)")
+                        }
+                }
                 return runSFTPRealServer(conn.RawConn(), rootDir, secret, verbose)
         }
 
@@ -947,6 +960,14 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // bridges them through the GS-encrypted channel to the remote
         // --sftp-real server.
         if flagSFTPRealClient > 0 {
+                // v0.3.0: Disable in-band mode if -i was set (same reason
+                // as --sftp-real server side).
+                if interactive {
+                        conn.DisableInBand()
+                        if verbose {
+                                logf("note: --sftp-real-client with -i: disabled in-band encoder (SSH handshake needs raw bytes)")
+                        }
+                }
                 return runSFTPRealClient(conn, flagSFTPRealClient, verbose)
         }
 
@@ -971,6 +992,12 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // after each disconnect, which covers the common case).
         if interactive {
                 if listen {
+                        // v0.3.0: --concurrent-peers enables TRUE concurrent multi-peer
+                        // (multiple simultaneous sessions). Default (0) = sequential
+                        // re-listen after each peer (v0.1.x behavior).
+                        if flagConcurrentPeers > 0 {
+                                return runConcurrentMultiPeerServer(conn, secret, relayHost, relayPort, opts, verbose, execCmd, flagConcurrentPeers, flagMaxPeers)
+                        }
                         // Multi-peer: server side re-listens after each peer.
                         // Pass the already-established conn as the first peer
                         // so we don't waste the completed TLS handshake.

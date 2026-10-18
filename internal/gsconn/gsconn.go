@@ -257,6 +257,24 @@ func (c *Conn) Role() gsrn.Role { return c.role }
 // Mode returns the local Mode (listen or connect).
 func (c *Conn) Mode() Mode { return c.mode }
 
+// DisableInBand (v0.3.0) disables in-band multiplexing on an existing
+// connection. After this call, Read/Write pass through to rawConn
+// directly (no escape-byte encoding/decoding).
+//
+// Used by --sftp-real to bypass the in-band encoder for SSH handshake
+// bytes. The SSH layer has its own framing and cannot tolerate
+// escape-byte corruption.
+//
+// Must be called BEFORE any I/O occurs on the conn (typically right
+// after Dial returns). Calling it after I/O has started is undefined.
+//
+// Safe for one-time use. Idempotent (calling twice is a no-op).
+func (c *Conn) DisableInBand() {
+        c.pktMu.Lock()
+        defer c.pktMu.Unlock()
+        c.ib = nil
+}
+
 // WrapRawConn (v0.2.0) replaces the underlying io.ReadWriteCloser with
 // the provided wrapper. The wrapper must satisfy io.ReadWriteCloser and
 // should typically delegate Read/Write/Close to the original conn it

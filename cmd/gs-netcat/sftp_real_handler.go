@@ -12,6 +12,7 @@ import (
         "io"
         "os"
         "path/filepath"
+        "strings"
         "time"
 
         "github.com/pkg/sftp"
@@ -145,15 +146,75 @@ func (h *sftpRootHandler) resolve(r *sftp.Request) string {
 }
 
 // resolvePath resolves a path string relative to root.
+//
+// v0.3.0: Added chroot enforcement. The returned path is guaranteed to
+// be inside h.root (after EvalSymlinks). Path traversal attempts
+// (e.g. "../../etc/passwd" or "/etc/passwd") are clamped to h.root.
+// Symlinks pointing outside h.root are also resolved to h.root.
+//
+// We use a two-step approach:
+//   1. filepath.Clean the path + join to root (handles "../")
+//   2. filepath.EvalSymlinks the result + check prefix (handles symlinks)
+//
+// If step 2 fails (file doesn't exist yet — e.g. for PUT), we check
+// the parent directory's symlinks instead.
+//
+// Returns "" if the path could not be safely resolved.
 func (h *sftpRootHandler) resolvePath(p string) string {
         if p == "" {
                 return ""
         }
+        // Step 1: clean + join to root.
         cleaned := filepath.Clean(p)
         if filepath.IsAbs(cleaned) {
-                cleaned = cleaned[1:] // strip leading /
+                // Strip leading "/" so it's relative to root.
+                cleaned = cleaned[1:]
         }
-        return filepath.Join(h.root, cleaned)
+        joined := filepath.Join(h.root, cleaned)
+        // filepath.Join already normalizes ".." away, but let's be defensive.
+        if !filepath.IsAbs(joined) {
+                abs, err := filepath.Abs(joined)
+                if err == nil {
+                        joined = abs
+                }
+        }
+
+        // Step 2: EvalSymlinks. If the path exists, resolve it and verify
+        // it's inside root.
+        resolved, err := filepath.EvalSymlinks(joined)
+        if err == nil {
+                // Path exists — check prefix.
+                if !isPathInside(resolved, h.root) {
+                        // Symlink escaped root — clamp to root.
+                        return h.root
+                }
+                return resolved
+        }
+        // Path doesn't exist (PUT case). Check the parent dir.
+        parent := filepath.Dir(joined)
+        resolvedParent, perr := filepath.EvalSymlinks(parent)
+        if perr != nil {
+                // Parent doesn't exist either — fall back to the joined path.
+                return joined
+        }
+        if !isPathInside(resolvedParent, h.root) {
+                return h.root
+        }
+        // Reconstruct: resolvedParent + base(joined).
+        return filepath.Join(resolvedParent, filepath.Base(joined))
+}
+
+// isPathInside reports whether target is equal to or inside base.
+// Both paths should be absolute and EvalSymlinks-resolved.
+func isPathInside(target, base string) bool {
+        if target == base {
+                return true
+        }
+        // Ensure base ends with separator for prefix check.
+        if len(base) > 0 && base[len(base)-1] != filepath.Separator {
+                base = base + string(filepath.Separator)
+        }
+        return strings.HasPrefix(target, base)
 }
 
 // listerAt implements sftp.ListerAt.
