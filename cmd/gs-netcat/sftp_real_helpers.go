@@ -3,7 +3,6 @@ package main
 
 import (
         "crypto/ed25519"
-        cryptorand "crypto/rand"
         "crypto/sha256"
         "fmt"
         "io"
@@ -12,26 +11,6 @@ import (
 
         "golang.org/x/crypto/ssh"
 )
-
-// generateRandomEd25519Signer generates a fresh ed25519 SSH host key.
-// Used for each SFTP-real session (no persistent host key file).
-//
-// Acceptable security model: the GS channel is already end-to-end
-// encrypted via TLS-SRP, and the SSH layer is just for protocol
-// compatibility with standard SFTP clients. The SSH host key only
-// matters if an attacker can MITM the GS-encrypted channel — which
-// they can't (TLS-SRP prevents that).
-func generateRandomEd25519Signer() (ssh.Signer, error) {
-        _, priv, err := ed25519.GenerateKey(cryptorand.Reader)
-        if err != nil {
-                return nil, err
-        }
-        signer, err := ssh.NewSignerFromKey(priv)
-        if err != nil {
-                return nil, err
-        }
-        return signer, nil
-}
 
 // deriveEd25519SignerFromSecret derives an ed25519 SSH host key
 // deterministically from the GS secret.
@@ -86,6 +65,3 @@ func (g *gsConnAdapter) RemoteAddr() net.Addr                { return &net.IPAdd
 func (g *gsConnAdapter) SetDeadline(t time.Time) error       { return nil }
 func (g *gsConnAdapter) SetReadDeadline(t time.Time) error   { return nil }
 func (g *gsConnAdapter) SetWriteDeadline(t time.Time) error  { return nil }
-
-// io is needed for ReadWriteCloser.
-var _ io.ReadWriteCloser = (io.ReadWriteCloser)(nil)

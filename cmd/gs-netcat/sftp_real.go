@@ -184,54 +184,11 @@ func handleSFTPSession(channel ssh.Channel, requests <-chan *ssh.Request, rootDi
 }
 
 // sftpRootHandler implements sftp.Handlers (FileGet, FilePut, FileCmd, FileList).
-// It uses pkg/sftp's built-in default handler that serves the local
-// filesystem. Chroot is NOT enforced — the SFTP user can navigate
-// anywhere the gs-netcat process can read.
-//
-// v0.3 will add proper chroot based on rootDir.
+// It serves the local filesystem rooted at sftpRootHandler.root.
+// v0.3.0: chroot enforced via resolvePath (EvalSymlinks + prefix check).
 type sftpRootHandler struct {
         root string
 }
 
-// For v0.2.5 we use sftp.DefaultHandlers which serves the entire
-// local filesystem. The sftpRootHandler above is a placeholder for
-// v0.3 chroot support.
-//
-// Returns the default SFTP handlers.
-func defaultSFTPHandlers(root string) sftp.Handlers {
-        return sftp.Handlers{
-                FileGet:  &sftpRootHandler{root: root},
-                FilePut:  &sftpRootHandler{root: root},
-                FileCmd:  &sftpRootHandler{root: root},
-                FileList: &sftpRootHandler{root: root},
-        }
-}
-
-// The sftpRootHandler methods are delegated to pkg/sftp's default
-// implementations. The pkg/sftp library expects the handler to
-// satisfy specific interfaces (FileGet, FilePut, FileCmd, FileList).
-// For v0.2.5 we use a wrapper that delegates to the default
-// implementations in sftp.requestServer.
-//
-// Actually, the simplest approach is to use the InMemHandler for
-// testing and the RequestServer directly. Let's just return
-// sftp.DefaultHandlers here.
-//
-// Note: sftp.DefaultHandlers was removed in newer versions. We
-// construct handlers manually using sftpRootHandler methods that
-// call the underlying os operations.
-
-// The pkg/sftp Handlers interface expects:
-//   FileGet  interface { Fileread(*Request) (io.ReadCloser, error) }
-//   FilePut  interface { Filewrite(*Request, io.Reader) (io.WriteCloser, error) }
-//   FileCmd  interface { Filecmd(*Request) error }
-//   FileList interface { Filelist(*Request) (ListerAt, error) }
-//
-// For v0.2.5, we implement these methods on sftpRootHandler.
-
-// We delegate to the default sftp.InMemFile / request methods.
-// Since pkg/sftp v1.13 doesn't export these directly, we use the
-// RequestServer with our handler that just calls os functions.
-
 // FileGet / FilePut / FileCmd / FileList methods on sftpRootHandler
-// are defined in sftp_real_handler.go for clarity.
+// are defined in sftp_real_handler.go.

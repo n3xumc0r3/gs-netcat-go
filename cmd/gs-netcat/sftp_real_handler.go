@@ -20,8 +20,7 @@ import (
 
 // fileReaderAt wraps *os.File to provide ReaderAt.
 type fileReaderAt struct {
-        f    *os.File
-        off  int64 // current offset (sequential reads via ReadAt use this)
+        f *os.File
 }
 
 func (r *fileReaderAt) ReadAt(p []byte, off int64) (int, error) {

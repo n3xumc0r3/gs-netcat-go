@@ -1,16 +1,16 @@
 module github.com/gsport/gs-netcat
 
-go 1.25.0
+go 1.26.0
 
-require golang.org/x/sys v0.47.0
+require (
+	github.com/klauspost/compress v1.20.3
+	github.com/pkg/sftp v1.13.11
+	github.com/refraction-networking/utls v1.8.2
+	golang.org/x/crypto v0.56.0
+	golang.org/x/sys v0.47.0
+)
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
-	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
-	github.com/gliderlabs/ssh v0.3.8 // indirect
-	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/kr/fs v0.1.0 // indirect
-	github.com/pkg/sftp v1.13.11 // indirect
-	github.com/refraction-networking/utls v1.8.2 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
 )
