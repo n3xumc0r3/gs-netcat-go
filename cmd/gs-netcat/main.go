@@ -296,6 +296,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
                 flagStealthHTTPS  bool   // --stealth-https
                 flagSFTP          string // --sftp <dir>
                 flagFileServer    bool   // --file-server (alias)
+                flagTLSFingerprint string // --tls-fingerprint <profile>
         )
 
         // Version is injected at build time via -ldflags. The default value
@@ -365,6 +366,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         fs.BoolVar(&flagStealthHTTPS, "stealth-https", false, "Wrap GSRN packets in fake TLS records (Go-Go only; bypasses port-443 DPI) [G↔G]")
         fs.StringVar(&flagSFTP, "sftp", "", "Run as simplified SFTP file server rooted at <dir> [G↔C]")
         fs.BoolVar(&flagFileServer, "file-server", false, "Alias for --sftp (legacy name)")
+        fs.StringVar(&flagTLSFingerprint, "tls-fingerprint", "", "Use pre-recorded browser ClientHello profile (chrome|firefox|safari|edge). Requires --stealth-https. [G↔G]")
 
         if err := fs.Parse(args); err != nil {
                 // -h / --help / -help / --h: Go's flag package has
@@ -811,7 +813,22 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // Done AFTER wrapConn (so it's the outermost wrapper) — DPI sees
         // the fake TLS records, not the underlying (potentially compressed)
         // bytes. clientSide = !listen (the SSL-CLIENT initiates the handshake).
+        //
+        // v0.2.0: --tls-fingerprint <profile> can be combined with --stealth-https
+        // to use a pre-recorded browser ClientHello (Chrome, Firefox, Safari, Edge).
+        // Requires --stealth-https (it modifies the ClientHello the stealth wrapper sends).
         if flagStealthHTTPS {
+                if flagTLSFingerprint != "" {
+                        profile := getTLSProfile(flagTLSFingerprint)
+                        if profile == nil {
+                                return fmt.Errorf("--tls-fingerprint: unknown profile %q (available: %s)", flagTLSFingerprint, listTLSProfiles())
+                        }
+                        if verbose {
+                                logf("stealth-https: using %s ClientHello profile", profile.Name)
+                        }
+                        // Store the profile in a global so stealthConn can use it.
+                        activeTLSProfile = profile
+                }
                 clientSide := !listen
                 if verbose {
                         logf("stealth-https: wrapping rawConn with fake TLS framing (clientSide=%v)", clientSide)

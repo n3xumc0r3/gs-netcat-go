@@ -33,6 +33,11 @@ import (
         "time"
 )
 
+// activeTLSProfile is set by main.go when --tls-fingerprint is given
+// (combined with --stealth-https). When non-nil, the stealth wrapper
+// uses this profile's ClientHello instead of the default minimal one.
+var activeTLSProfile *tlsFingerprintProfile
+
 // stealthConn wraps an io.ReadWriteCloser with fake TLS record framing.
 type stealthConn struct {
         inner   io.ReadWriteCloser
@@ -141,12 +146,21 @@ func (s *stealthConn) Read(p []byte) (int, error) {
 // writeClientHello writes a fake ClientHello so the initial bytes the
 // peer sees look like a TLS handshake initiation.
 //
+// If activeTLSProfile is set (via --tls-fingerprint), uses the
+// profiled ClientHello (Chrome, Firefox, etc.) instead of the minimal
+// default. The profiled ClientHello matches the cipher suite order and
+// extension list of real browsers, helping evade JA3 fingerprinting.
+//
 // The ClientHello is NOT a real one — it's a static blob that mimics
 // the structure (record type 0x16, version 0x0301, then handshake
 // type 0x01, then a random session_id + cipher_suites + extensions).
 // A DPI that only checks "is the first byte 0x16 and version 0x03xx"
 // will pass it. A DPI that actually parses TLS will see it's bogus.
 func (s *stealthConn) writeClientHello() error {
+        // v0.2.0: Use profiled ClientHello if available.
+        if activeTLSProfile != nil {
+                return writeProfiledClientHello(s, activeTLSProfile)
+        }
         // Build a 137-byte fake ClientHello.
         ch := make([]byte, 137)
         // Handshake type = 0x01 (ClientHello)
