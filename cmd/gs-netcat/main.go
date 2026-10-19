@@ -1336,18 +1336,51 @@ func runInteractiveServer(conn *gsconn.Conn, ctx *eventCtx, verbose bool, remote
         // explicit call in the shellDone branch below) is safe.
         defer conn.Close()
 
+        // v0.3.4: PTY deadlock fix. The previous code did:
+        //   case <-remoteClosed:
+        //       pty.Close()
+        //       <-shellDone          // ← THIS CAN HANG FOREVER
+        //
+        // If pty.Close() doesn't properly terminate the shell (which
+        // happens when the shell ignores SIGHUP, or when the PTY fd
+        // is in a bad state), shellDone never fires and the multi-peer
+        // loop is stuck forever. The relay never gets a new _gs_listen,
+        // and clients get CONNREFUSED.
+        //
+        // Fix: add a 5-second timeout on shellDone after pty.Close().
+        // If the shell doesn't exit within 5s, SIGKILL it via pty.Close()
+        // (which calls process.Kill() on the second invocation).
         select {
         case <-remoteClosed:
                 // Remote hung up — close the PTY to terminate the shell.
                 pty.Close()
-                <-shellDone
+                // v0.3.4: wait for shell with timeout — don't hang forever.
+                select {
+                case <-shellDone:
+                        // Shell exited cleanly.
+                case <-time.After(5 * time.Second):
+                        // Shell didn't exit in 5s — force kill.
+                        if verbose {
+                                logf("server: shell didn't exit after 5s, force killing PTY")
+                        }
+                        pty.Close() // second Close() should SIGKILL
+                        <-shellDone
+                }
         case err := <-shellDone:
                 // Shell exited — close the conn so remote sees EOF.
                 if verbose && err != nil {
                         logf("shell exited: %v", err)
                 }
                 conn.Close()
-                <-remoteClosed
+                select {
+                case <-remoteClosed:
+                        // Remote acknowledged EOF.
+                case <-time.After(5 * time.Second):
+                        // Remote didn't close in 5s — force close.
+                        if verbose {
+                                logf("server: remote didn't close after shell exit, force closing")
+                        }
+                }
         }
 
         if verbose {
