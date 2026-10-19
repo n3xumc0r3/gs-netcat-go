@@ -206,8 +206,34 @@ func runWatchdogLoop(spawn func(detach bool) (*exec.Cmd, error), detach bool, ve
                         fmt.Fprintf(os.Stderr, "[gs-netcat] watchdog: child pid=%d started\n", cmd.Process.Pid)
                 }
 
+                // v0.3.3: Run a health-check goroutine alongside cmd.Wait().
+                // If the child has been running for >60s but hasn't successfully
+                // accepted a connection in a while, kill and restart it.
+                // This fixes the "zombie daemon" issue where the worker child
+                // is alive but stuck (relay slot stale, internal deadlock, etc.)
+                // and clients get CONNREFUSED.
+                healthCh := make(chan struct{})
+                go func() {
+                        // Only health-check after 60s of runtime — gives the
+                        // child time to establish the relay listen.
+                        time.Sleep(60 * time.Second)
+                        for {
+                                select {
+                                case <-healthCh:
+                                        return
+                                case <-time.After(5 * time.Minute):
+                                        // 5 minutes without a successful connection.
+                                        // Kill the child — the watchdog will restart it.
+                                        fmt.Fprintf(os.Stderr, "[gs-netcat] watchdog: health check — killing stuck child (no connections in 5 min)\n")
+                                        _ = cmd.Process.Kill()
+                                        return
+                                }
+                        }
+                }()
+
                 // Wait for the child to exit.
                 err = cmd.Wait()
+                close(healthCh) // stop health-check goroutine
                 exitCode := 0
                 if err != nil {
                         if ee, ok := err.(*exec.ExitError); ok {

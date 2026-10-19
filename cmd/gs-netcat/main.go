@@ -313,7 +313,7 @@ Example SOCKS5 server (tunnel all local apps through remote):
         // below is used when the binary is built without the ldflags override
         // (e.g. `go build` without -ldflags). Bumping this string is the
         // single source of truth for the user-visible version.
-        const defaultVersion = "v0.3.2-feat"
+        const defaultVersion = "v0.3.3-feat"
         version := defaultVersion
         fs.BoolVar(&listen, "l", false, "Listen mode (be the server peer)")
         fs.StringVar(&secretStr, "s", "", strs.Decode([]byte{0xae, 0xba, 0x96, 0xba, 0xac, 0xaa, 0xbb, 0xac, 0xbd, 0xe9, 0xba, 0xbd, 0xbb, 0xa0, 0xa7, 0xae}, 0xc9))
@@ -832,9 +832,41 @@ Example SOCKS5 server (tunnel all local apps through remote):
                         flagMaxPeers)
         }
 
-        conn, err := dialWithPortFallback(secret, mode, opts, relayHost, relayPort, userPickedRelay, verbose)
-        if err != nil {
-                return err
+        // v0.3.3: -w (wait) flag retry loop. If -w is set and the first
+        // dial fails (CONNREFUSED, timeout), retry with exponential backoff
+        // instead of dying. This matches the C behavior where -w blocks
+        // until a listener appears.
+        var conn *gsconn.Conn
+        var err error
+        if flagWait && !listen {
+                backoff := time.Second
+                const maxWaitBackoff = 60 * time.Second
+                for attempt := 1; ; attempt++ {
+                        conn, err = dialWithPortFallback(secret, mode, opts, relayHost, relayPort, userPickedRelay, verbose)
+                        if err == nil {
+                                break
+                        }
+                        // Check if it's a non-retryable error (not CONNREFUSED/timeout).
+                        errStr := err.Error()
+                        if !strings.Contains(errStr, "CONNREFUSED") &&
+                           !strings.Contains(errStr, "i/o timeout") &&
+                           !strings.Contains(errStr, "EOF") {
+                                return err
+                        }
+                        if verbose || attempt <= 3 {
+                                logf("-w: server not available (attempt %d): %v — retrying in %v", attempt, err, backoff)
+                        }
+                        time.Sleep(backoff)
+                        backoff *= 2
+                        if backoff > maxWaitBackoff {
+                                backoff = maxWaitBackoff
+                        }
+                }
+        } else {
+                conn, err = dialWithPortFallback(secret, mode, opts, relayHost, relayPort, userPickedRelay, verbose)
+                if err != nil {
+                        return err
+                }
         }
         defer conn.Close()
 
@@ -1420,9 +1452,16 @@ func runInteractiveClient(conn *gsconn.Conn, verbose bool, wantPwd, wantIDS bool
         defer resizeStop()
 
         // Pipe stdin -> conn, conn -> stdout.
+        // v0.3.3: On Windows, use a custom stdin reader that properly
+        // handles arrow keys and other special keys via ReadConsoleInput.
+        // On Unix, os.Stdin in raw mode generates ANSI sequences natively.
         stdinDone := make(chan struct{})
         go func() {
-                n, _ := io.Copy(conn, os.Stdin)
+                var stdinReader io.Reader = os.Stdin
+                if sr := getStdinReader(); sr != nil {
+                        stdinReader = sr
+                }
+                n, _ := io.Copy(conn, stdinReader)
                 if os.Getenv("GSPORT_DEBUG") != "" {
                         fmt.Fprintf(os.Stderr, "%s [gsport] stdin->conn io.Copy returned: n=%d\n",
                                 time.Now().Format("15:04:05.000"), n)
